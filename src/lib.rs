@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bitvec::bitvec;
 use bitvec::vec::BitVec;
-use std::collections::{self, HashMap, HashSet};
 use murmur3::murmur3_32;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 const STATIC_VECTOR_LENGTH: u32 = 4096;
@@ -17,6 +17,7 @@ const STATIC_INNER_BLOOM_FULL_LENGTH: u64 = 2_u64.pow(INITIAL_INNER_BLOOM_SIZE);
 const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 13;
 
+const MIN_OUTER_BITS_PER_KEY: f32 = 9.2;
 const MIN_INNER_BITS_PER_KEY: f32 = 19.2;
 
 pub struct PerfectBloomFilter {
@@ -27,10 +28,10 @@ pub struct PerfectBloomFilter {
 
 impl Default for PerfectBloomFilter {
     fn default() -> Self {
-        Self { 
-            big_bloom: Default::default(), 
-            partitioned_blooms: Default::default(), 
-            metadata: Default::default() 
+        Self {
+            big_bloom: Default::default(),
+            partitioned_blooms: Default::default(),
+            metadata: Default::default(),
         }
     }
 }
@@ -38,17 +39,17 @@ impl Default for PerfectBloomFilter {
 impl PerfectBloomFilter {
     pub fn contains_and_insert(&mut self, key: &str) -> Result<bool> {
         // Phase 1
-        let key_partitions = self.big_bloom_hash(&key)?;
+        let key_partitions = self.big_bloom_hash(key)?;
         let key_exists: bool = self.big_bloom_check(&key_partitions)?;
 
-        if !key_exists { 
+        if !key_exists {
             self.big_bloom_insert(&key_partitions);
         }
         println!("BIG bloom: {}", key_exists);
 
         // Phase 2
-        let vector_partitions = self.vector_partition_hash(&key)?;
-        let inner_bloom_hashes = self.inner_bloom_hash(&vector_partitions, &key)?;
+        let vector_partitions = self.vector_partition_hash(key)?;
+        let inner_bloom_hashes = self.inner_bloom_hash(&vector_partitions, key)?;
         let collision_map = self.inner_bloom_check(&inner_bloom_hashes)?;
         let collision_result = check_collision(&collision_map)?;
 
@@ -64,23 +65,21 @@ impl PerfectBloomFilter {
                 println!("ENUM: Partial");
                 false
             }
-            CollisionResult::Complete(partition_a,partition_b) => { 
+            CollisionResult::Complete(partition_a, partition_b) => {
                 println!("ENUM: Complete");
                 true
-            },
+            }
             CollisionResult::Error => {
                 //self.inner_bloom_insert(&inner_bloom_hashes);
                 println!("ENUM: Error");
                 false
-            }        
+            }
         };
 
         println!("Inner bloom: {}", collision_result);
 
         Ok(key_exists && collision_result)
     }
-
-    
 
     fn big_bloom_hash(&self, key: &str) -> Result<Vec<u64>> {
         let mut hash_index_list: Vec<u64> =
@@ -95,19 +94,17 @@ impl PerfectBloomFilter {
         Ok(hash_index_list)
     }
 
-    fn big_bloom_check(&self, key_partitions: &Vec<u64>) -> Result<bool> {
+    fn big_bloom_check(&self, key_partitions: &[u64]) -> Result<bool> {
         let key_exists = key_partitions
             .iter()
             .all(|&key| self.big_bloom.body[key as usize]);
         Ok(key_exists)
     }
 
-    fn big_bloom_insert(&mut self, key_partitions: &Vec<u64>) {
-        key_partitions.iter()
-            .for_each(|&bloom_index| {
-                self.big_bloom.body.set(bloom_index as usize, true)
-            }
-        );
+    fn big_bloom_insert(&mut self, key_partitions: &[u64]) {
+        key_partitions
+            .iter()
+            .for_each(|&bloom_index| self.big_bloom.body.set(bloom_index as usize, true));
     }
 
     fn vector_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
@@ -115,7 +112,6 @@ impl PerfectBloomFilter {
         let mut partitions = HashSet::with_capacity(STATIC_VECTOR_PARTITIONS);
 
         for seed in 0..STATIC_VECTOR_PARTITIONS {
-            
             let hash_result = murmur3_32(&mut Cursor::new(key.as_bytes()), seed as u32)?;
             let final_hash = hash_result % STATIC_VECTOR_LENGTH;
 
@@ -131,14 +127,14 @@ impl PerfectBloomFilter {
         }
 
         let partition_vec: Vec<u32> = partitions.into_iter().collect();
-        
+
         Ok(partition_vec)
     }
 
     fn inner_bloom_hash(
         &self,
         vector_partitions: &Vec<u32>,
-        key: &str
+        key: &str,
     ) -> Result<HashMap<u32, Vec<u64>>> {
         let mut inner_hash_list = HashMap::new();
 
@@ -159,14 +155,13 @@ impl PerfectBloomFilter {
         Ok(inner_hash_list)
     }
 
-
     fn inner_bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<HashMap<u32, bool>> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
-        
-        for (index, map) in map.iter() { 
-            let key_exists = map.iter().all(|&key|
-                self.partitioned_blooms.body[*index as usize][key as usize]
-            );
+
+        for (index, map) in map.iter() {
+            let key_exists = map
+                .iter()
+                .all(|&key| self.partitioned_blooms.body[*index as usize][key as usize]);
             collision_map.insert(*index, key_exists);
         }
 
@@ -177,15 +172,12 @@ impl PerfectBloomFilter {
         for (vector_index, hashes) in inner_hashed {
             hashes.iter().for_each(|&bloom_index| {
                 self.partitioned_blooms.body[*vector_index as usize].set(bloom_index as usize, true)
-            
             });
         }
     }
-
 }
 
-
-fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult>{
+fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
     let mut collided = vec![];
 
     map.iter().for_each(|(vector_indx, boolean)| {
@@ -198,7 +190,7 @@ fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult>{
         [] => CollisionResult::Zero,
         [one] => CollisionResult::Partial(**one),
         [one, two] => CollisionResult::Complete(**one, **two),
-        _ => CollisionResult::Error
+        _ => CollisionResult::Error,
     };
 
     Ok(collision_result)
@@ -232,17 +224,19 @@ impl Default for Dissolver {
 }
 
 struct MetaDataBlooms {
-    big_bloom_key_count: u64, 
-    inner_blooms_key_count: HashMap<u32, u64>, 
+    big_bloom_key_count: u64,
+    inner_blooms_key_count: HashMap<u32, u64>,
 
-    big_bloom_bit_length: u64, 
-    inner_bloom_bit_length: HashMap<u32, u64>, 
+    big_bloom_bit_length: u64,
+    inner_bloom_bit_length: HashMap<u32, u64>,
 }
 
 impl Default for MetaDataBlooms {
     fn default() -> Self {
-        let mut key_count: HashMap<u32, u64> = HashMap::with_capacity(STATIC_VECTOR_LENGTH as usize);
-        let mut bit_length: HashMap<u32, u64> = HashMap::with_capacity(STATIC_VECTOR_LENGTH as usize);
+        let mut key_count: HashMap<u32, u64> =
+            HashMap::with_capacity(STATIC_VECTOR_LENGTH as usize);
+        let mut bit_length: HashMap<u32, u64> =
+            HashMap::with_capacity(STATIC_VECTOR_LENGTH as usize);
 
         for partition in 0..STATIC_VECTOR_LENGTH {
             key_count.insert(partition, 0);
@@ -260,10 +254,10 @@ impl Default for MetaDataBlooms {
 }
 
 enum CollisionResult {
-    Zero, 
+    Zero,
     Partial(u32),
     Complete(u32, u32),
-    Error
+    Error,
 }
 
 #[cfg(test)]
@@ -273,7 +267,7 @@ mod tests {
     #[test]
     fn test_filter() {
         let temp_key1 = "First_Value".to_string(); // false
-        let temp_key2 = "First_Value".to_string(); // true 
+        let temp_key2 = "First_Value".to_string(); // true
         let temp_key3 = "First_Value_new".to_string(); // false
         let temp_key4 = "First_Value".to_string(); // true
         let temp_key5 = "First_Value_new".to_string(); // true
@@ -308,13 +302,11 @@ mod tests {
         for i in 1..count {
             let key = i.to_string();
             let was_present = pf.contains_and_insert(&key).unwrap();
-        if !was_present {
-            println!("BUG: Key '{}' was missing after supposed insertion!", key);
-            // Optionally: panic! or break here to see the first failure
-        }
+            if !was_present {
+                println!("BUG: Key '{}' was missing after supposed insertion!", key);
+                // Optionally: panic! or break here to see the first failure
+            }
             assert_eq!(was_present, true);
         }
- 
-        
     }
 }
