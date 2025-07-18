@@ -4,6 +4,9 @@ use bitvec::vec::BitVec;
 use murmur3::murmur3_32;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 const STATIC_VECTOR_LENGTH: u32 = 4096;
 const STATIC_VECTOR_PARTITIONS: usize = 2;
@@ -24,6 +27,7 @@ pub struct PerfectBloomFilter {
     big_bloom: BigBloom,
     partitioned_blooms: Dissolver,
     metadata: MetaDataBlooms,
+    disk_io_cache: Vec<(u32, String)>,
 }
 
 impl Default for PerfectBloomFilter {
@@ -32,53 +36,85 @@ impl Default for PerfectBloomFilter {
             big_bloom: Default::default(),
             partitioned_blooms: Default::default(),
             metadata: Default::default(),
+            disk_io_cache: Vec::new(),
         }
     }
 }
 
 impl PerfectBloomFilter {
+    fn new_pbf_with_thread() -> Arc<Mutex<PerfectBloomFilter>> {
+        let filter = Arc::new(Mutex::new(Self::default()));
+        let filter_clone = Arc::clone(&filter);
+
+        thread::spawn(move || { // spawn a thread for handling disk io, writing to disk from cache
+            loop {
+                {
+                    let mut pbf = filter_clone.lock().unwrap();
+                    // do the meta data calculations here
+                }
+                thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        thread::spawn(move || { // spawn a thread for handling the resizing of the inner bloomfilters
+            loop {
+                {
+                  // let mut pbf = filter_clone.lock().unwrap();
+                    // do the meta data calculations here
+                }
+                thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        filter
+    }
+
     pub fn contains_and_insert(&mut self, key: &str) -> Result<bool> {
         // Phase 1
-        let key_partitions = self.big_bloom_hash(key)?;
-        let key_exists: bool = self.big_bloom_check(&key_partitions)?;
+        let outer_bloom_key_idx = self.big_bloom_hash(key)?;
+        let outer_bloom_key_exists: bool = self.big_bloom_check(&outer_bloom_key_idx)?;
 
-        if !key_exists {
-            self.big_bloom_insert(&key_partitions);
+        if !outer_bloom_key_exists {
+            self.big_bloom_insert(&outer_bloom_key_idx);
         }
-        println!("BIG bloom: {}", key_exists);
 
         // Phase 2
-        let vector_partitions = self.vector_partition_hash(key)?;
-        let inner_bloom_hashes = self.inner_bloom_hash(&vector_partitions, key)?;
-        let collision_map = self.inner_bloom_check(&inner_bloom_hashes)?;
-        let collision_result = check_collision(&collision_map)?;
+        let vector_idx = self.vector_partition_hash(key)?;
+        let inner_bloom_key_idx = self.inner_bloom_hash(&vector_idx, key)?;
+        let collision_map = self.inner_bloom_check(&inner_bloom_key_idx)?;
+        let collision_result: CollisionResult = check_collision(&collision_map)?;
 
         // Phase 3
-        let collision_result = match collision_result {
+        let collision_result: bool = match collision_result {
             CollisionResult::Zero => {
-                self.inner_bloom_insert(&inner_bloom_hashes);
-                println!("ENUM: Zero");
+                self.inner_bloom_insert(&inner_bloom_key_idx);
                 false
             }
             CollisionResult::Partial(partition) => {
-                self.inner_bloom_insert(&inner_bloom_hashes);
-                println!("ENUM: Partial");
+                self.inner_bloom_insert(&inner_bloom_key_idx);
                 false
             }
             CollisionResult::Complete(partition_a, partition_b) => {
-                println!("ENUM: Complete");
                 true
             }
             CollisionResult::Error => {
-                //self.inner_bloom_insert(&inner_bloom_hashes);
-                println!("ENUM: Error");
                 false
             }
         };
 
-        println!("Inner bloom: {}", collision_result);
+        // Phase 4
+        // On deck
+        self.insert_disk_io_cache(key, vector_idx);
 
-        Ok(key_exists && collision_result)
+        Ok(outer_bloom_key_exists && collision_result)
+    }
+
+    fn insert_disk_io_cache(&mut self, key: &str, vector_idx: Vec<u32>) -> Result<()> {
+        for idx in vector_idx {
+            self.disk_io_cache.push((idx, key.to_owned()));
+        }
+
+        Ok(())
     }
 
     fn big_bloom_hash(&self, key: &str) -> Result<Vec<u64>> {
@@ -273,13 +309,13 @@ mod tests {
         let temp_key5 = "First_Value_new".to_string(); // true
         let temp_key6 = "First_Value_newa".to_string(); // false
 
-        let mut pf = PerfectBloomFilter::default();
-        let result_a = pf.contains_and_insert(&temp_key1).unwrap();
-        let result_b = pf.contains_and_insert(&temp_key2).unwrap();
-        let result_c = pf.contains_and_insert(&temp_key3).unwrap();
-        let result_d = pf.contains_and_insert(&temp_key4).unwrap();
-        let result_e = pf.contains_and_insert(&temp_key5).unwrap();
-        let result_f = pf.contains_and_insert(&temp_key6).unwrap();
+        let mut pf = PerfectBloomFilter::new_pbf_with_thread();
+        let result_a = pf.lock().unwrap().contains_and_insert(&temp_key1).unwrap();
+        let result_b = pf.lock().unwrap().contains_and_insert(&temp_key2).unwrap();
+        let result_c = pf.lock().unwrap().contains_and_insert(&temp_key3).unwrap();
+        let result_d = pf.lock().unwrap().contains_and_insert(&temp_key4).unwrap();
+        let result_e = pf.lock().unwrap().contains_and_insert(&temp_key5).unwrap();
+        let result_f = pf.lock().unwrap().contains_and_insert(&temp_key6).unwrap();
 
         assert_eq!(result_a, false);
         assert_eq!(result_b, true);
@@ -289,19 +325,19 @@ mod tests {
         assert_eq!(result_f, false);
     }
 
-    #[test]
-    fn test_filter_loop() {
+    #[tokio::test]
+    async fn test_filter_loop() {
         let count = 1_000_000;
-        let mut pf = PerfectBloomFilter::default();
+        let mut pf = PerfectBloomFilter::new_pbf_with_thread();
         for i in 1..count {
             let key = i.to_string();
-            let result_insert = pf.contains_and_insert(&key).unwrap();
+            let result_insert = pf.lock().unwrap().contains_and_insert(&key).unwrap();
             assert_eq!(result_insert, false);
         }
 
         for i in 1..count {
             let key = i.to_string();
-            let was_present = pf.contains_and_insert(&key).unwrap();
+            let was_present = pf.lock().unwrap().contains_and_insert(&key).unwrap();
             if !was_present {
                 println!("BUG: Key '{}' was missing after supposed insertion!", key);
                 // Optionally: panic! or break here to see the first failure
