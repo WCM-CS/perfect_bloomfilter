@@ -56,20 +56,26 @@ impl PerfectBloomFilter {
         let collision_result = match collision_result {
             CollisionResult::Zero => {
                 self.inner_bloom_insert(&inner_bloom_hashes);
+                println!("ENUM: Zero");
                 false
             }
             CollisionResult::Partial(partition) => {
                 self.inner_bloom_insert(&inner_bloom_hashes);
+                println!("ENUM: Partial");
                 false
             }
             CollisionResult::Complete(partition_a,partition_b) => { 
+                println!("ENUM: Complete");
                 true
             },
             CollisionResult::Error => {
                 //self.inner_bloom_insert(&inner_bloom_hashes);
+                println!("ENUM: Error");
                 false
             }        
         };
+
+        println!("Inner bloom: {}", collision_result);
 
         Ok(key_exists && collision_result)
     }
@@ -135,17 +141,36 @@ impl PerfectBloomFilter {
      */
   
 
-    
+    // BUG found HERE?!?!?! key hashed into the same vector index both times, solution, chache pervious key if equals new key use seed=33
 
     fn vector_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
+        let mut cached_vector_slot: Option<u32> = None;
         let mut partitions = HashSet::with_capacity(STATIC_VECTOR_PARTITIONS);
 
         for seed in 0..STATIC_VECTOR_PARTITIONS {
+            
             let hash_result = murmur3_32(&mut Cursor::new(key.as_bytes()), seed as u32)?;
-            partitions.insert(hash_result % STATIC_VECTOR_LENGTH);
+            let final_hash = hash_result % STATIC_VECTOR_LENGTH;
+            if key == "5441" {
+                println!("KEY 5441 partitions: {final_hash}")
+            }
+
+            let clash: bool = cached_vector_slot.is_some_and(|slot| slot == final_hash);
+            if clash {
+                let new_hash = murmur3_32(&mut Cursor::new(key.as_bytes()), 33)?;
+                let new_hash_mod = new_hash % STATIC_VECTOR_LENGTH;
+                partitions.insert(new_hash_mod);
+            } else {
+                partitions.insert(final_hash);
+            }
+
+            cached_vector_slot = Some(final_hash);
         }
+
+        let partition_vec: Vec<u32> = partitions.into_iter().collect();
+        //partition_vec.sort_unstable(); // Guarantee deterministic order
         
-        Ok(partitions.into_iter().collect())
+        Ok(partition_vec)
     }
 
     fn inner_bloom_hash(
