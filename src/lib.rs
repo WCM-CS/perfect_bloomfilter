@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 const STATIC_VECTOR_LENGTH: u32 = 4096;
-const STATIC_VECTOR_PARTITIONS: usize = 2;
+const STATIC_VECTOR_PARTITIONS: u32 = 2;
 
 const STATIC_OUTER_BLOOM_SIZE: u32 = 32;
 const INITIAL_INNER_BLOOM_SIZE: u32 = 20;
@@ -22,6 +22,8 @@ const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 13;
 
 const MIN_OUTER_BITS_PER_KEY: f32 = 9.2;
 const MIN_INNER_BITS_PER_KEY: f32 = 19.2;
+
+static HASH_SEED_SELECTION: [u32; 5] = [9, 223, 372, 036, 854];
 
 pub struct PerfectBloomFilter {
     big_bloom: BigBloom,
@@ -46,7 +48,7 @@ impl PerfectBloomFilter {
         let filter = Arc::new(Mutex::new(Self::default()));
         let filter_clone = Arc::clone(&filter);
 
-        // DISK IO THREAD
+        
         thread::spawn(move || {
             // spawn a thread for handling disk io, writing to disk from cache
             loop {
@@ -68,6 +70,9 @@ impl PerfectBloomFilter {
                 thread::sleep(Duration::from_secs(60));
             }
         });
+         
+        // DISK IO THREAD
+        
 
         filter
     }
@@ -141,10 +146,9 @@ impl PerfectBloomFilter {
     fn big_bloom_hash(&self, key: &str) -> Result<Vec<u64>> {
         let mut hash_index_list: Vec<u64> =
             Vec::with_capacity(OUTER_BLOOM_HASH_FAMILY_SIZE as usize);
-        let hash_const = 8;
 
-        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), hash_const)?;
-        let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), hash_const.wrapping_add(55))?;
+        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[0])?;
+        let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[1])?;
 
         for idx in 0..OUTER_BLOOM_HASH_FAMILY_SIZE {
             let index = (h1.wrapping_add(idx.wrapping_mul(h2))) as u64 % STATIC_OUTER_BLOOM_FULL_LENGTH as u64;
@@ -171,7 +175,7 @@ impl PerfectBloomFilter {
     }
 
     fn vector_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
-        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), 33)? % STATIC_VECTOR_LENGTH;
+        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])? % STATIC_VECTOR_LENGTH;
 
         let p1 = h1;
         let p2 = (h1 + STATIC_VECTOR_LENGTH / 2) % STATIC_VECTOR_LENGTH;
@@ -193,8 +197,8 @@ impl PerfectBloomFilter {
             };
 
             let mut key_hashes = Vec::with_capacity(INNER_BLOOM_HASH_FAMILY_SIZE as usize);
-            let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), vector_slot)?;
-            let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), vector_slot.wrapping_add(55))?;
+            let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[3])?;
+            let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[4])?;
             
             for i in 0..INNER_BLOOM_HASH_FAMILY_SIZE {
                 let index = (h1.wrapping_add(i.wrapping_mul(h2))) % bloom_length as u32;
@@ -352,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_loop() {
-        let count = 5_000_000;
+        let count = 20_000_000;
         let pf = PerfectBloomFilter::new_pbf_with_thread();
 
         println!("Phase 1: Inserting {} new keys..", count);
@@ -382,7 +386,7 @@ mod tests {
         let dur2 = start.elapsed();
         eprintln!("Phase done in {:.2?}", dur2);
         
-        let count2 = 10_000_000;
+        let count2 = 40_000_000;
         for i in count..count2 {
             let key = i.to_string();
             let was_present = pf.lock().unwrap().contains_and_insert(&key).unwrap();
