@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bitvec::bitvec;
 use bitvec::vec::BitVec;
 use murmur3::murmur3_32;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,7 +14,7 @@ const STATIC_VECTOR_PARTITIONS: usize = 2;
 const STATIC_OUTER_BLOOM_SIZE: u32 = 32;
 const INITIAL_INNER_BLOOM_SIZE: u32 = 20;
 
-const STATIC_OUTER_BLOOM_FULL_LENGTH: u64 = 2_u64.pow(STATIC_OUTER_BLOOM_SIZE);
+const STATIC_OUTER_BLOOM_FULL_LENGTH: u128 = 2_u128.pow(STATIC_OUTER_BLOOM_SIZE);
 const STATIC_INNER_BLOOM_FULL_LENGTH: u64 = 2_u64.pow(INITIAL_INNER_BLOOM_SIZE);
 
 const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
@@ -46,7 +46,9 @@ impl PerfectBloomFilter {
         let filter = Arc::new(Mutex::new(Self::default()));
         let filter_clone = Arc::clone(&filter);
 
-        thread::spawn(move || { // spawn a thread for handling disk io, writing to disk from cache
+        // DISK IO THREAD
+        thread::spawn(move || {
+            // spawn a thread for handling disk io, writing to disk from cache
             loop {
                 {
                     let mut pbf = filter_clone.lock().unwrap();
@@ -56,10 +58,11 @@ impl PerfectBloomFilter {
             }
         });
 
-        thread::spawn(move || { // spawn a thread for handling the resizing of the inner bloomfilters
+        thread::spawn(move || {
+            // spawn a thread for handling the resizing of the inner bloomfilters
             loop {
                 {
-                  // let mut pbf = filter_clone.lock().unwrap();
+                    // let mut pbf = filter_clone.lock().unwrap();
                     // do the meta data calculations here
                 }
                 thread::sleep(Duration::from_secs(60));
@@ -78,35 +81,53 @@ impl PerfectBloomFilter {
             self.big_bloom_insert(&outer_bloom_key_idx);
         }
 
+        
         // Phase 2
         let vector_idx = self.vector_partition_hash(key)?;
         let inner_bloom_key_idx = self.inner_bloom_hash(&vector_idx, key)?;
         let collision_map = self.inner_bloom_check(&inner_bloom_key_idx)?;
         let collision_result: CollisionResult = check_collision(&collision_map)?;
 
-        // Phase 3
-        let collision_result: bool = match collision_result {
-            CollisionResult::Zero => {
+
+        let inner_bloom_key_exists = matches!(collision_result, CollisionResult::Complete(_, _));
+        
+        match collision_result {
+            CollisionResult::Zero | CollisionResult::Partial(_) => {
                 self.inner_bloom_insert(&inner_bloom_key_idx);
-                false
-            }
-            CollisionResult::Partial(partition) => {
-                self.inner_bloom_insert(&inner_bloom_key_idx);
-                false
-            }
-            CollisionResult::Complete(partition_a, partition_b) => {
-                true
             }
             CollisionResult::Error => {
-                false
+                panic!("unexpected issue with collision result for key: {key}");
             }
-        };
+            _ => {}
+        }
+
+        /*
+           let is_reported_present = outer_bloom_key_exists && inner_bloom_key_exists;
+
+        // 🚨 Print diagnostic info if filter thinks it already saw this key
+        if is_reported_present {
+            println!("⚠️ FALSE POSITIVE POSSIBLE:");
+            println!("  Key: {}", key);
+            println!("  Outer bloom: PRESENT");
+            println!("  Inner bloom result: {:?}", collision_result);
+            println!("  Outer indices: {:?}", outer_bloom_key_idx);
+            println!("  Inner partitions: {:?}", vector_idx);
+            println!("  Inner indices map: {:?}", inner_bloom_key_idx);
+        }
+         */
+
+        
+     
+
+         
+
+    
 
         // Phase 4
         // On deck
-        self.insert_disk_io_cache(key, vector_idx);
+        //self.insert_disk_io_cache(key, vector_idx)?;
 
-        Ok(outer_bloom_key_exists && collision_result)
+        Ok(outer_bloom_key_exists && matches!(collision_result, CollisionResult::Complete(_, _)))
     }
 
     fn insert_disk_io_cache(&mut self, key: &str, vector_idx: Vec<u32>) -> Result<()> {
@@ -120,11 +141,15 @@ impl PerfectBloomFilter {
     fn big_bloom_hash(&self, key: &str) -> Result<Vec<u64>> {
         let mut hash_index_list: Vec<u64> =
             Vec::with_capacity(OUTER_BLOOM_HASH_FAMILY_SIZE as usize);
+        let hash_const = 8;
 
-        for seed in 0..OUTER_BLOOM_HASH_FAMILY_SIZE {
-            let hash_result = murmur3_32(&mut Cursor::new(&key.as_bytes()), seed).unwrap();
-            let final_hash = hash_result as u64 % STATIC_OUTER_BLOOM_FULL_LENGTH;
-            hash_index_list.push(final_hash);
+        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), hash_const)?;
+        let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), hash_const.wrapping_add(55))?;
+
+        for idx in 0..OUTER_BLOOM_HASH_FAMILY_SIZE {
+            let index = (h1.wrapping_add(idx.wrapping_mul(h2))) as u64 % STATIC_OUTER_BLOOM_FULL_LENGTH as u64;
+
+            hash_index_list.push(index.into());
         }
 
         Ok(hash_index_list)
@@ -141,37 +166,24 @@ impl PerfectBloomFilter {
         key_partitions
             .iter()
             .for_each(|&bloom_index| self.big_bloom.body.set(bloom_index as usize, true));
+
+        self.metadata.big_bloom_key_count += 1;
     }
 
     fn vector_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
-        let mut cached_vector_slot: Option<u32> = None;
-        let mut partitions = HashSet::with_capacity(STATIC_VECTOR_PARTITIONS);
+        let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), 33)? % STATIC_VECTOR_LENGTH;
 
-        for seed in 0..STATIC_VECTOR_PARTITIONS {
-            let hash_result = murmur3_32(&mut Cursor::new(key.as_bytes()), seed as u32)?;
-            let final_hash = hash_result % STATIC_VECTOR_LENGTH;
+        let p1 = h1;
+        let p2 = (h1 + STATIC_VECTOR_LENGTH / 2) % STATIC_VECTOR_LENGTH;
 
-            if cached_vector_slot.is_some_and(|slot| slot == final_hash) {
-                let new_hash = murmur3_32(&mut Cursor::new(key.as_bytes()), 33)?;
-                let new_hash_mod = new_hash % STATIC_VECTOR_LENGTH;
-                partitions.insert(new_hash_mod);
-            } else {
-                partitions.insert(final_hash);
-            }
-
-            cached_vector_slot = Some(final_hash);
-        }
-
-        let partition_vec: Vec<u32> = partitions.into_iter().collect();
-
-        Ok(partition_vec)
+        Ok(vec![p1, p2])
     }
 
     fn inner_bloom_hash(
         &self,
         vector_partitions: &Vec<u32>,
         key: &str,
-    ) -> Result<HashMap<u32, Vec<u64>>> {
+    ) -> Result<HashMap<u32, Vec<u32>>> {
         let mut inner_hash_list = HashMap::new();
 
         for &vector_slot in vector_partitions {
@@ -181,17 +193,21 @@ impl PerfectBloomFilter {
             };
 
             let mut key_hashes = Vec::with_capacity(INNER_BLOOM_HASH_FAMILY_SIZE as usize);
-            for seed in 0..INNER_BLOOM_HASH_FAMILY_SIZE {
-                let hash_result = murmur3_32(&mut Cursor::new(key.as_bytes()), seed)?;
-                let final_hash = hash_result as u64 % bloom_length;
-                key_hashes.push(final_hash)
+            let h1 = murmur3_32(&mut Cursor::new(key.as_bytes()), vector_slot)?;
+            let h2 = murmur3_32(&mut Cursor::new(key.as_bytes()), vector_slot.wrapping_add(55))?;
+            
+            for i in 0..INNER_BLOOM_HASH_FAMILY_SIZE {
+                let index = (h1.wrapping_add(i.wrapping_mul(h2))) % bloom_length as u32;
+
+                key_hashes.push(index)
             }
+
             inner_hash_list.insert(vector_slot, key_hashes);
         }
         Ok(inner_hash_list)
     }
 
-    fn inner_bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<HashMap<u32, bool>> {
+    fn inner_bloom_check(&self, map: &HashMap<u32, Vec<u32>>) -> Result<HashMap<u32, bool>> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
 
         for (index, map) in map.iter() {
@@ -204,11 +220,17 @@ impl PerfectBloomFilter {
         Ok(collision_map)
     }
 
-    fn inner_bloom_insert(&mut self, inner_hashed: &HashMap<u32, Vec<u64>>) {
+    fn inner_bloom_insert(&mut self, inner_hashed: &HashMap<u32, Vec<u32>>) {
         for (vector_index, hashes) in inner_hashed {
             hashes.iter().for_each(|&bloom_index| {
                 self.partitioned_blooms.body[*vector_index as usize].set(bloom_index as usize, true)
             });
+            
+            self.metadata
+                .inner_blooms_key_count
+                .entry(*vector_index)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
         }
     }
 }
@@ -224,8 +246,8 @@ fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
 
     let collision_result = match collided.as_slice() {
         [] => CollisionResult::Zero,
-        [one] => CollisionResult::Partial(**one),
-        [one, two] => CollisionResult::Complete(**one, **two),
+        [&one] => CollisionResult::Partial(one),
+        [&one, &two] => CollisionResult::Complete(one, two),
         _ => CollisionResult::Error,
     };
 
@@ -263,7 +285,7 @@ struct MetaDataBlooms {
     big_bloom_key_count: u64,
     inner_blooms_key_count: HashMap<u32, u64>,
 
-    big_bloom_bit_length: u64,
+    big_bloom_bit_length: u128,
     inner_bloom_bit_length: HashMap<u32, u64>,
 }
 
@@ -289,6 +311,7 @@ impl Default for MetaDataBlooms {
     }
 }
 
+#[derive(Debug)]
 enum CollisionResult {
     Zero,
     Partial(u32),
@@ -298,6 +321,7 @@ enum CollisionResult {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
     use crate::PerfectBloomFilter;
 
     #[test]
@@ -309,13 +333,14 @@ mod tests {
         let temp_key5 = "First_Value_new".to_string(); // true
         let temp_key6 = "First_Value_newa".to_string(); // false
 
-        let mut pf = PerfectBloomFilter::new_pbf_with_thread();
-        let result_a = pf.lock().unwrap().contains_and_insert(&temp_key1).unwrap();
-        let result_b = pf.lock().unwrap().contains_and_insert(&temp_key2).unwrap();
-        let result_c = pf.lock().unwrap().contains_and_insert(&temp_key3).unwrap();
-        let result_d = pf.lock().unwrap().contains_and_insert(&temp_key4).unwrap();
-        let result_e = pf.lock().unwrap().contains_and_insert(&temp_key5).unwrap();
-        let result_f = pf.lock().unwrap().contains_and_insert(&temp_key6).unwrap();
+        let mut pf = PerfectBloomFilter::default();
+       
+        let result_a = pf.contains_and_insert(&temp_key1).unwrap();
+        let result_b = pf.contains_and_insert(&temp_key2).unwrap();
+        let result_c = pf.contains_and_insert(&temp_key3).unwrap();
+        let result_d = pf.contains_and_insert(&temp_key4).unwrap();
+        let result_e = pf.contains_and_insert(&temp_key5).unwrap();
+        let result_f = pf.contains_and_insert(&temp_key6).unwrap();
 
         assert_eq!(result_a, false);
         assert_eq!(result_b, true);
@@ -327,22 +352,64 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_loop() {
-        let count = 1_000_000;
-        let mut pf = PerfectBloomFilter::new_pbf_with_thread();
-        for i in 1..count {
+        let count = 5_000_000;
+        let pf = PerfectBloomFilter::new_pbf_with_thread();
+
+        println!("Phase 1: Inserting {} new keys..", count);
+        let start = Instant::now();
+
+        for i in 0..count {
             let key = i.to_string();
-            let result_insert = pf.lock().unwrap().contains_and_insert(&key).unwrap();
-            assert_eq!(result_insert, false);
+            let mut pf_guard = pf.lock().expect("Failed to lock bloom filter");
+            let is_present = pf_guard.contains_and_insert(&key).expect("Insert failed unexpectedly");
+
+            assert_eq!(is_present, false);
         }
 
-        for i in 1..count {
+        let dur1 = start.elapsed();
+        eprintln!("Phase done in {:.2?}", dur1);
+
+       
+        for i in 0..count {
             let key = i.to_string();
             let was_present = pf.lock().unwrap().contains_and_insert(&key).unwrap();
             if !was_present {
                 println!("BUG: Key '{}' was missing after supposed insertion!", key);
-                // Optionally: panic! or break here to see the first failure
             }
             assert_eq!(was_present, true);
         }
+
+        let dur2 = start.elapsed();
+        eprintln!("Phase done in {:.2?}", dur2);
+        
+        let count2 = 10_000_000;
+        for i in count..count2 {
+            let key = i.to_string();
+            let was_present = pf.lock().unwrap().contains_and_insert(&key).unwrap();
+            if !was_present {
+                println!("BUG: Key '{}' was missing after supposed insertion!", key);
+            }
+            assert_eq!(was_present, false);
+        }
+
+        let dur3 = start.elapsed();
+        eprintln!("Phase done in {:.2?}", dur3);
+
+        for i in count..count2 {
+            let key = i.to_string();
+            let was_present = pf.lock().unwrap().contains_and_insert(&key).unwrap();
+            if !was_present {
+                println!("BUG: Key '{}' was missing after supposed insertion!", key);
+            }
+            assert_eq!(was_present, true);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+
+        let dur4 = start.elapsed();
+        eprintln!("Phase done in {:.2?}", dur4);
+        
+        
     }
 }
