@@ -104,9 +104,9 @@ impl PerfectBloomFilter {
         /*
            let is_reported_present = outer_bloom_key_exists && inner_bloom_key_exists;
 
-        // 🚨 Print diagnostic info if filter thinks it already saw this key
+        // Print diagnostic info if filter thinks it already saw this key
         if is_reported_present {
-            println!("⚠️ FALSE POSITIVE POSSIBLE:");
+            println!("FALSE POSITIVE POSSIBLE:");
             println!("  Key: {}", key);
             println!("  Outer bloom: PRESENT");
             println!("  Inner bloom result: {:?}", collision_result);
