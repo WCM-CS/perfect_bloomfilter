@@ -2,11 +2,16 @@ use anyhow::{anyhow, Result};
 use bitvec::bitvec;
 use bitvec::vec::BitVec;
 use murmur3;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use tokio::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 type VectorPartition = u32;
 type Key = String;
@@ -28,45 +33,70 @@ const MIN_INNER_BITS_PER_KEY: f32 = 19.2;
 
 static HASH_SEED_SELECTION: [u32; 5] = [9, 223, 372, 630, 854];
 
+
+
 #[derive(Default)]
 pub struct PerfectBloomFilter {
     big_bloom: BigBloom,
     partitioned_blooms: Dissolver,
     metadata: MetaDataBlooms,
-    disk_io_cache: Vec<(VectorPartition, Key)>,
+    disk_io_cache: HashMap<VectorPartition, Vec<Key>>,
+    background_tasks: Vec<JoinHandle<()>>,
 }
 
 impl PerfectBloomFilter {
-    fn new_pbf_with_thread() -> Arc<Mutex<PerfectBloomFilter>> {
-        let filter = Arc::new(Mutex::new(Self::default()));
-        let filter_clone = Arc::clone(&filter);
+    async fn new_thing(tasks_enabled: bool) -> Arc<Mutex<PerfectBloomFilter>> {
+        tracing::info!("Creating filter for you");
+        let user_filter = Arc::new(Mutex::new(Self {
+            background_tasks: Vec::new(),
+            ..Default::default()
+        }));
 
-        thread::spawn(move || {
-            // spawn a thread for handling disk io, writing to disk from cache
-            loop {
-                {
-                    let mut pbf = filter_clone.lock().unwrap();
-                    // do the meta data calculations here
+        tracing::info!("Made filter");
+        
+
+        if tasks_enabled {
+            let writer_filter_clone = Arc::clone(&user_filter);
+            tracing::info!("cloned struct");
+
+
+            tracing::info!("calling join handle ");
+            let handle = tokio::spawn(async move { // spawn cache drainer/disk writer
+                loop {
+                    sleep(Duration::from_secs(15)).await;
+                    tracing::info!("in the loop for the handle"); 
+
+                    {   
+                        tracing::info!("calling join handle ");
+                        sleep(Duration::from_secs(15)).await;
+                        let mut writer = writer_filter_clone.lock().await;
+
+                        writer.drain_runtime().await;
+
+                    }
                 }
-                thread::sleep(Duration::from_secs(60));
+            });
+
+            {
+                let mut locked = user_filter.lock().await;
+                locked.background_tasks.push(handle);
+
             }
-        });
 
-        thread::spawn(move || {
-            // spawn a thread for handling the resizing of the inner bloomfilters
-            loop {
-                {
-                    // let mut pbf = filter_clone.lock().unwrap();
-                    // do the meta data calculations here
-                }
-                thread::sleep(Duration::from_secs(60));
-            }
-        });
 
-        // DISK IO THREAD
 
-        filter
+        }
+
+        user_filter
     }
+
+    pub async fn drain_runtime(&mut self) {
+         tracing::info!(">>> drain_runtime called");
+        tracing::info!("Value before drain: {}", self.disk_io_cache.len());
+        self.disk_io_cache.clear();
+        self.disk_io_cache.shrink_to_fit();
+        tracing::info!("Value after drain: {}", self.disk_io_cache.len());
+    }  
 
     pub fn contains_and_insert(&mut self, key: &str) -> Result<bool> {
         // Phase 1
@@ -83,43 +113,33 @@ impl PerfectBloomFilter {
         let collision_map = self.inner_bloom_check(&inner_bloom_key_idx)?;
         let collision_result: CollisionResult = check_collision(&collision_map)?;
 
-        let inner_bloom_key_exists = matches!(collision_result, CollisionResult::Complete(_, _));
-
-        match collision_result {
+        let inner_bloom_key_exists = match collision_result {
             CollisionResult::Zero | CollisionResult::Partial(_) => {
                 self.inner_bloom_insert(&inner_bloom_key_idx);
+                false
+            }
+            CollisionResult::Complete(_,_) => {
+                true
             }
             CollisionResult::Error => {
                 panic!("unexpected issue with collision result for key: {key}");
             }
-            _ => {}
-        }
+        };
 
-        /*
-           let is_reported_present = outer_bloom_key_exists && inner_bloom_key_exists;
+       
+        self.insert_disk_io_cache(key, vector_idx)?;
+       
+        
 
-        // Print diagnostic info if filter thinks it already saw this key
-        if is_reported_present {
-            println!("FALSE POSITIVE POSSIBLE:");
-            println!("  Key: {}", key);
-            println!("  Outer bloom: PRESENT");
-            println!("  Inner bloom result: {:?}", collision_result);
-            println!("  Outer indices: {:?}", outer_bloom_key_idx);
-            println!("  Inner partitions: {:?}", vector_idx);
-            println!("  Inner indices map: {:?}", inner_bloom_key_idx);
-        }
-         */
-
-        // Phase 4
-        // On deck
-        //self.insert_disk_io_cache(key, vector_idx)?;
-
-        Ok(outer_bloom_key_exists && matches!(collision_result, CollisionResult::Complete(_, _)))
+        Ok(outer_bloom_key_exists && inner_bloom_key_exists)
     }
 
     fn insert_disk_io_cache(&mut self, key: &str, vector_idx: Vec<u32>) -> Result<()> {
         for idx in vector_idx {
-            self.disk_io_cache.push((idx, key.to_owned()));
+            self.disk_io_cache
+            .entry(idx)
+            .or_default()
+            .push(key.to_string());
         }
 
         Ok(())
@@ -267,11 +287,18 @@ impl PerfectBloomFilter {
     }
 
     fn dump_inner_bloom_data(&self) {
+         let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("false_positive_blooms.txt")
+            .expect("Failed to open log file");
+
         self.metadata
             .inner_blooms_key_count
             .iter()
             .for_each(|(key, value)| {
-                tracing::info!("Vector partition: {key}\nKey insertions: {value}\n");
+                let log_line = format!("Vector partition: {key}, Key insertions: {value}\n");
+                writeln!(file, "{log_line}").expect("Failed to write inner bloom data to file");
             })
     }
 }
@@ -362,7 +389,8 @@ enum CollisionResult {
 #[cfg(test)]
 mod tests {
     use crate::PerfectBloomFilter;
-    use std::time::Instant;
+    use std::{fs::OpenOptions, time::Instant};
+    use std::io::Write;
 
     #[test]
     fn test_filter() {
@@ -392,28 +420,54 @@ mod tests {
 
     /*
      */
+
+    // inner blooms sized ar 2^20 returns a false negative at 22 million
+    // rasie this to 2^22 and we get false positive a 550 million
     #[tokio::test]
     async fn test_filter_loop() {
-        tracing_subscriber::fmt::init();
+        tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .init();
         let count = 100_000_000;
-        let pf = PerfectBloomFilter::new_pbf_with_thread();
-
-        let mut locked_pf = pf.lock().unwrap();
+        let pf = PerfectBloomFilter::new_thing(true).await;
+        
 
         tracing::info!("Starting Insert phase 1");
         for i in 0..count {
             let key = i.to_string();
-            let is_present = locked_pf
-                .contains_and_insert(&key)
-                .expect("Insert failed unexpectedly");
 
-            assert_eq!(is_present, false);
+            let was_present = {
+                let mut locked_pf = pf.lock().await;
+                
+                locked_pf.contains_and_insert(&key).expect("Insert failed unexpectedly")
+            };
+
+            /*
+             */
+            if was_present {
+                tracing::error!("Value was a false positive: {key}, Jikes buster, you suck");
+                //locked_pf.dump_inner_bloom_data();
+                let key_copy = key.to_owned();
+
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("false_positives.txt")
+                    .expect("Failed to open log file");
+
+                writeln!(file, "{key_copy}").expect("Failed to write key to file");
+            }
+
+
+            assert_eq!(was_present, false);
         }
         tracing::info!("Completed Insert phase 1");
+        //let mut locked_pf = pf.lock().await;
 
         tracing::info!("Starting confirmation phase 1");
         for i in 0..count {
             let key = i.to_string();
+            let mut locked_pf = pf.lock().await;
             let was_present = locked_pf
                 .contains_and_insert(&key)
                 .expect("Insert failed unexpectedly");
@@ -426,6 +480,7 @@ mod tests {
         // worked at value of 60 million keys for no collisoin as is
         let count2 = 200_000_000;
         for i in count..count2 {
+            let mut locked_pf = pf.lock().await;
             let key = i.to_string();
             let was_present = locked_pf
                 .contains_and_insert(&key)
@@ -434,6 +489,16 @@ mod tests {
             if was_present {
                 tracing::error!("Value was a false positive: {key}, Jikes buster, you suck");
                 locked_pf.dump_inner_bloom_data();
+                let key_copy = key.to_owned();
+
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("false_positives.txt")
+                    .expect("Failed to open log file");
+
+                writeln!(file, "{key_copy}").expect("Failed to write key to file");
+               
             }
 
             assert_eq!(was_present, false);
@@ -442,6 +507,7 @@ mod tests {
 
         tracing::info!("Starting confirmation phase 2");
         for i in count..count2 {
+            let mut locked_pf = pf.lock().await;
             let key = i.to_string();
             let was_present = locked_pf.contains_and_insert(&key).unwrap();
             if !was_present {
