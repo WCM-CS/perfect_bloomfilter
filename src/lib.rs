@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 use std::fs::OpenOptions;
 use std::io::Write;
+use rusqlite::{params, Connection, OpenFlags};
 
 type VectorPartition = u32;
 type Key = String;
@@ -33,6 +34,22 @@ const MIN_INNER_BITS_PER_KEY: f32 = 19.2;
 
 static HASH_SEED_SELECTION: [u32; 5] = [9, 223, 372, 630, 854];
 
+struct SqlClient {
+    client: Connection
+}
+
+impl Default for SqlClient {
+    fn default() -> Self {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+                  | OpenFlags::SQLITE_OPEN_CREATE
+                  | OpenFlags::SQLITE_OPEN_FULL_MUTEX; // enables serialized/thread-safe mode
+
+        let client = Connection::open_with_flags("./tester.db", flags)
+            .expect("Failed to open DB connection");
+
+        Self { client }
+    }
+}
 
 
 #[derive(Default)]
@@ -42,10 +59,11 @@ pub struct PerfectBloomFilter {
     metadata: MetaDataBlooms,
     disk_io_cache: HashMap<VectorPartition, Vec<Key>>,
     background_tasks: Vec<JoinHandle<()>>,
+    client: SqlClient,
 }
 
 impl PerfectBloomFilter {
-    async fn new_thing(tasks_enabled: bool) -> Arc<Mutex<PerfectBloomFilter>> {
+    async fn new_thing(tasks_enabled: bool) -> Result<Arc<Mutex<PerfectBloomFilter>>> {
         tracing::info!("Creating filter for you");
         let user_filter = Arc::new(Mutex::new(Self {
             background_tasks: Vec::new(),
@@ -59,44 +77,96 @@ impl PerfectBloomFilter {
             let writer_filter_clone = Arc::clone(&user_filter);
             tracing::info!("cloned struct");
 
+            {
+                let mut locked = writer_filter_clone.lock().await;
+                locked.sqlite_init()?;
+            }
+
 
             tracing::info!("calling join handle ");
-            let handle = tokio::spawn(async move { // spawn cache drainer/disk writer
+            let writer_handle = tokio::spawn(async move { // spawn cache drainer/disk writer
                 loop {
                     sleep(Duration::from_secs(15)).await;
                     tracing::info!("in the loop for the handle"); 
 
                     {   
                         tracing::info!("calling join handle ");
-                        sleep(Duration::from_secs(15)).await;
                         let mut writer = writer_filter_clone.lock().await;
 
-                        writer.drain_runtime().await;
-
+                        match writer.sqlite_egress() {
+                            Ok(_) => tracing::info!("Successfully egressed to sqlite"),
+                            Err(_) => tracing::info!("Failed egressed to sqlite"),
+                        }
                     }
                 }
             });
 
+
             {
                 let mut locked = user_filter.lock().await;
-                locked.background_tasks.push(handle);
+                locked.background_tasks.push(writer_handle);
 
             }
-
-
-
         }
 
-        user_filter
+        Ok(user_filter)
     }
 
-    pub async fn drain_runtime(&mut self) {
-         tracing::info!(">>> drain_runtime called");
-        tracing::info!("Value before drain: {}", self.disk_io_cache.len());
-        self.disk_io_cache.clear();
+    fn sqlite_lookup(&mut self, partition: u32) -> Result<Vec<String>> {
+        let mut results = Vec::new();
+
+        let mut stmt = self.client.client.prepare(
+            "SELECT value FROM pbf WHERE partition = ?"
+        )?;
+
+        let value_iter = stmt.query_map([partition], |row| {
+            let value: String = row.get(0)?;
+            Ok(value)
+        })?;
+
+        for value in value_iter {
+            results.push(value?);
+        }
+
+        Ok(results)
+    }
+
+    fn sqlite_egress(&mut self) -> Result<()> {
+        let tx = self.client.client.transaction()?;
+
+        for(partition, keys) in self.disk_io_cache.drain() {
+            for key in keys {
+                tx.execute("INSERT INTO pbf (partition, value) VALUES (?, ?)", 
+                    params![partition.to_string(), key])?;
+            }
+        }
+
+        match tx.commit() {
+            Ok(_) => tracing::info!("Completed drain to sqlite"),
+            Err(_) => tracing::info!("Failed drain to sqlite"),
+        }
+
         self.disk_io_cache.shrink_to_fit();
-        tracing::info!("Value after drain: {}", self.disk_io_cache.len());
+
+        Ok(())
     }  
+
+    fn sqlite_init(&mut self) -> Result<()> {
+        let make_table = "
+            CREATE TABLE IF NOT EXISTS pbf (
+                id INTEGER PRIMARY KEY,
+                partition INTEGER NOT NULL,
+                value TEXT NOT NULL
+            );
+                
+            CREATE INDEX IF NOT EXISTS main_idx ON pbf(partition);";
+
+        let conn = &self.client.client;
+
+        conn.execute_batch(make_table)?;
+        Ok(())
+
+    }
 
     pub fn contains_and_insert(&mut self, key: &str) -> Result<bool> {
         // Phase 1
@@ -424,12 +494,12 @@ mod tests {
     // inner blooms sized ar 2^20 returns a false negative at 22 million
     // rasie this to 2^22 and we get false positive a 550 million
     #[tokio::test]
-    async fn test_filter_loop() {
+    async fn test_filter_loop()  {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
         let count = 100_000_000;
-        let pf = PerfectBloomFilter::new_thing(true).await;
+        let pf = PerfectBloomFilter::new_thing(true).await.unwrap();
         
 
         tracing::info!("Starting Insert phase 1");
@@ -516,5 +586,6 @@ mod tests {
             assert_eq!(was_present, true);
         }
         tracing::info!("Completed confirmation phase 2");
+
     }
 }
