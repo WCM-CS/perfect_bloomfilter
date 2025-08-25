@@ -3,3 +3,4 @@
 *.lock
 
 *.db
+/pbf_data

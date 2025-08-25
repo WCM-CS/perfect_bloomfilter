@@ -20,4 +20,12 @@ Dynamically scalable cascading multidimensional bloom filter
   Current config set to: 1 in 2.4 trillion queries
 
 
+
+  Refactoring to use a more modular and scalable design
+
+  No big bloom only multidimensional blooms using array intead of a vector for reduces overhead during the hash slot sharding. Also refactoring to use arenas for each bloom filter and arc swap to make it async compatible and allow for reduced overhead for key insertions via the bloom being in a preallocated contiguous arena in the healp and accessed via pointer and dropped in constant time. This paired with the existing jump hash partition for hash slot sharding and double hash for bloom filter insertion should work well. 
+
+  Also thinking about wasy of minimizing overhead for io suck as usisng a protobuf instead of embedded db or simple txt file. 
+
+
 </details>
