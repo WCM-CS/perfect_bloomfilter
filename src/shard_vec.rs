@@ -15,25 +15,52 @@ static HASH_SEED_SELECTION: [u32; 5] = [9, 223, 372, 630, 854];
 const NUM_U64_ELEMENTS: usize = ((BLOOM_DEFAULT_LENGTH + 63) / 64) as usize; //ceiling div
 
 //const STATIC_VECTOR_LENGTH_COMPACT: u32 = 2048; // n < 100 million
-const STATIC_VECTOR_LENGTH_STANDARD: usize = 4096; // n > 100 million && n < 800 million
+//const STATIC_VECTOR_LENGTH_STANDARD: usize = 4096; // n > 100 million && n < 800 million
+
+const STATIC_VECTOR_LENGTH_OUTER: usize = 4096;
+const STATIC_VECTOR_LENGTH_INNER: usize = 8192;
 //const STATIC_VECTOR_LENGTH_BIOG_DATA: u32 = 8192; // n > 800 million
 
 //14 start at 14 which faislonce you get to 650k then we ned to resize te bloomfilters
-static BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(14)) as usize;
+// with the three hashes we can now use n^14 with over 650k elements
+// fails at 2^14 1m
+// fails at 2^16 3m
+// fails at 2^18 7.2m
+// 2^22 passes 20 million fails at 22m
+
+/* finding ideal k during runtime for new filter
+estiate n
+m = bit vec length aftr resizing
+m/n threshold is the min bits per key derived to perform well for the neested filters with 0 complete collisions, may differe per the FpLevel flag
+
+    n = m/(m/n)threshold 
+
+*/
+
+
+static BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(22)) as usize;
 
 enum DiskCache {
     C1,
-    C2,
-    C3
+    C2
 }
 
 // Define the struct for the array of blooms
-pub struct PerfectBloomFilterInner {
-    shard_array1: Arc<RwLock<ShardArray>>,
+pub struct PerfectBloomFilterOuter {
+    shard_array1: Arc<RwLock<OuterShardArray>>,
     metadata: Arc<RwLock<ShardArrMeta>>,
     disk_cache_array1: Arc<Mutex<HashMap<u32, Vec<String>>>>
 }
 
+pub struct PerfectBloomFilterInner {
+    shard_array1: Arc<RwLock<InnerShardArray>>,
+    metadata: Arc<RwLock<ShardArrMeta>>,
+    disk_cache_array1: Arc<Mutex<HashMap<u32, Vec<String>>>>
+}
+
+
+
+/*
 impl PerfectBloomFilterInner {
     async fn rehash_system (&self) -> Result<()> {
         let bits_per_key_min: f64 = 15.5;
@@ -72,12 +99,13 @@ impl PerfectBloomFilterInner {
         }
     }
 }
+ */
+
 
 async fn write_disk_io_cache(data: HashMap<u32, Vec<String>>, cache_type: DiskCache) -> Result<()> {
     let node = match cache_type {
         DiskCache::C1 => "node1",
-        DiskCache::C2 => "node2",
-        DiskCache::C3 => "node3",
+        DiskCache::C2 => "node2"
     };
 
 
@@ -117,25 +145,32 @@ impl PerfectBloomFilterInner {
 }
 
 pub struct PerfectBloomFilter {
-    node1: Arc<PerfectBloomFilterInner>,
-    node2: Option<Arc<Mutex<PerfectBloomFilterInner>>>,
-    node3: Option<Arc<Mutex<PerfectBloomFilterInner>>>,
+    outer_filter: Arc<PerfectBloomFilterOuter>,
+    inner_filter: Arc<PerfectBloomFilterInner>
 }
 
 impl PerfectBloomFilter {
     pub fn new() -> Result<Self>{
 
-        let user_filter = Arc::new(PerfectBloomFilterInner {
-            shard_array1: Arc::new(RwLock::new(ShardArray::default())),
-            metadata: Arc::new(RwLock::new(ShardArrMeta::default())),
+        let outer_filter = Arc::new(PerfectBloomFilterOuter {
+            shard_array1: Arc::new(RwLock::new(OuterShardArray::default())),
+            metadata: Arc::new(RwLock::new(ShardArrMeta::new(DiskCache::C1))),
             disk_cache_array1: Arc::new(Mutex::new(HashMap::new())),
         });    
 
-        let drain_filter = Arc::clone(&user_filter);
-        let rehash_filter = Arc::clone(&user_filter);
+        let inner_filter = Arc::new(PerfectBloomFilterInner {
+            shard_array1: Arc::new(RwLock::new(InnerShardArray::default())),
+            metadata: Arc::new(RwLock::new(ShardArrMeta::new(DiskCache::C2))),
+            disk_cache_array1: Arc::new(Mutex::new(HashMap::new())),
+        });
 
+        //let drain_filter = Arc::clone(&user_filter);
+        //let rehash_filter = Arc::clone(&user_filter);
+
+        /*
         tokio::spawn(async move {
-            sleep(Duration::from_secs(5)).await;
+            //delete_files().await;
+            sleep(Duration::from_secs(15)).await;
 
             let mut locked_cache = drain_filter.disk_cache_array1.lock().await;
             let data = std::mem::take(&mut *locked_cache);
@@ -144,12 +179,20 @@ impl PerfectBloomFilter {
             write_disk_io_cache(data, DiskCache::C1).await.unwrap();
             
         });
+        
+         */
 
+        
+
+        /*
         tokio::spawn(async move {
             let _ = rehash_filter.rehash_system().await;
         });
+         */
 
-        Ok(Self {node1: user_filter, node2: None, node3: None})
+       
+
+        Ok(Self {outer_filter, inner_filter })
     }
 
 
@@ -158,7 +201,7 @@ impl PerfectBloomFilter {
     pub async fn contains_insert(&mut self, key: &str) -> Result<bool> {
 
         // returns two shard idx/partitions/bloom filters
-        let shards_idx = self.array_partition_hash(key).await?;
+        let shards_idx = self.array_partition_hash(key, DiskCache::C1).await?;
         // gets the keys hashes for the bloom filters 
         let inner_bloom_key_idx = self.bloom_hash(&shards_idx, key).await?;
         // checks if there is a collision and to what degree
@@ -167,18 +210,28 @@ impl PerfectBloomFilter {
         let key_exists = match &collision_result {
             CollisionResult::Zero => {
                 self.bloom_insert(&inner_bloom_key_idx).await;
+                if let Err(e) = self.insert_disk_io_cache(key, shards_idx).await{
+                    tracing::warn!("Failed to insert data into the cache: {e}")
+                }
                 false
             }
              CollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&inner_bloom_key_idx).await;
+                if let Err(e) = self.insert_disk_io_cache(key, shards_idx).await{
+                    tracing::warn!("Failed to insert data into the cache: {e}")
+                }
                 false
             }
             CollisionResult::PartialMajor(s1, s2) => {
-                tracing::info!("Major collision for the bloom filter at shards: {:?} & {:?}", s1, s2);
+                tracing::info!("Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
                 self.bloom_insert(&inner_bloom_key_idx).await;
+                if let Err(e) = self.insert_disk_io_cache(key, shards_idx).await{
+                    tracing::warn!("Failed to insert data into the cache: {e}")
+                }
                 false
             }
-            CollisionResult::Complete(_,_, _) => {
+            CollisionResult::Complete(s1,s2, s3) => {
+                tracing::info!("Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}", s1, s2, s3, key);
                 true
             }
             CollisionResult::Error => {
@@ -186,17 +239,13 @@ impl PerfectBloomFilter {
             }
         };
 
-        if let Err(e) = self.insert_disk_io_cache(key, shards_idx) .await{
-            tracing::warn!("Failed to insert data into the cache: {e}")
-        }
-
-
+       
         Ok(key_exists)
 
     }
 
     async fn insert_disk_io_cache(&mut self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
-        let mut inner = self.node1.disk_cache_array1.lock().await;
+        let mut inner = self.ou.disk_cache_array1.lock().await;
      
         for idx in shards_idx {
             inner
@@ -210,33 +259,28 @@ impl PerfectBloomFilter {
 
    
 
-    async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
+    async fn array_partition_hash(&self, key: &str, shard: DiskCache) -> Result<Vec<u32>> {
+        // two shards: jump hash p1 and use n/2 mod shard len
+        // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
+
+        let shard_len: u32 = match shard {
+            DiskCache::C1 => STATIC_VECTOR_LENGTH_OUTER.try_into().unwrap(),
+            DiskCache::C2 => STATIC_VECTOR_LENGTH_INNER.try_into().unwrap(),
+        };
+       
         let h1 =
             murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[3])?;
 
         let high = (h1 >> 64) as u64;
         let low = h1 as u64;
+        let shard_size = shard_len / 3;
 
-        let p1 = self.jump_hash_partition(high, STATIC_VECTOR_LENGTH_STANDARD as u32)?;
-        let mut p2 = self.jump_hash_partition(low, STATIC_VECTOR_LENGTH_STANDARD as u32)?;
-        let mut p3 = self.jump_hash_partition(high ^ low, STATIC_VECTOR_LENGTH_STANDARD as u32)?;
+        let p1 = self.jump_hash_partition(high ^ low, shard_len as u32)?;
+        let p2 = (p1 + shard_size) % shard_len as u32;
+        let p3 = (p1 + (2 * shard_size)) % shard_len as u32;
         
         
-        // utilize deterministic rehashing with xor principle
-        if p1 == p2 {
-            let rehashed = self.jump_hash_partition(high ^ low, STATIC_VECTOR_LENGTH_STANDARD as u32)?;
-
-            p2 = if rehashed != p1 {
-                rehashed
-            } else {
-                (p1 + ((low ^ high) % (STATIC_VECTOR_LENGTH_STANDARD as u64 - 1) + 1) as u32)
-                    % STATIC_VECTOR_LENGTH_STANDARD as u32
-            }
-        }
-
-        if p3 == p1 || p3 == p2 {
-            p3 = (p3 +1) % STATIC_VECTOR_LENGTH_STANDARD as u32;
-        }
+        debug_assert!(p1 != p2 && p1 != p3 && p2 != p3, "Partitions must be unique");
 
         Ok(vec![p1, p2, p3])
     }
@@ -336,6 +380,7 @@ impl PerfectBloomFilter {
     async fn bloom_insert(&mut self, inner_hashed: &HashMap<u32, Vec<u64>>) {
         let mut inner = self.node1.shard_array1.write().await;
         let mut inner_met = self.node1.metadata.write().await;
+
         for (vector_index, hashes) in inner_hashed {
             hashes.iter().for_each(|&bloom_index| {
                 inner.data[*vector_index as usize].set(bloom_index as usize, true)
@@ -356,15 +401,28 @@ impl PerfectBloomFilter {
 }
 
 #[derive(Debug)]
-struct ShardArray {
-    data: [BitVec; STATIC_VECTOR_LENGTH_STANDARD as usize],
+struct OuterShardArray {
+    data: [BitVec; STATIC_VECTOR_LENGTH_OUTER],
 }
 
-impl Default for ShardArray {
+impl Default for OuterShardArray {
     fn default() -> Self {
         let empty_bitvec = bitvec![0; BLOOM_DEFAULT_LENGTH];
         let data = std::array::from_fn(|_| empty_bitvec.clone());
-        ShardArray { data }
+        OuterShardArray { data }
+    }
+}
+
+#[derive(Debug)]
+struct InnerShardArray {
+    data: [BitVec; STATIC_VECTOR_LENGTH_INNER],
+}
+
+impl Default for InnerShardArray {
+    fn default() -> Self {
+        let empty_bitvec = bitvec![0; BLOOM_DEFAULT_LENGTH];
+        let data = std::array::from_fn(|_| empty_bitvec.clone());
+        InnerShardArray { data }
     }
 }
 
@@ -376,13 +434,24 @@ struct ShardArrMeta {
 }
 
 impl Default for ShardArrMeta {
-    fn default() -> Self {
-         let mut key_count: HashMap<u32, u64> =
-            HashMap::with_capacity(STATIC_VECTOR_LENGTH_STANDARD as usize);
-        let mut bit_length: HashMap<u32, u64> =
-            HashMap::with_capacity(STATIC_VECTOR_LENGTH_STANDARD as usize);
+    fn default() -> Self { // dont use this
+        Self::new(DiskCache::C1)
+    }
+}
 
-        for partition in 0..STATIC_VECTOR_LENGTH_STANDARD as u32 {
+impl ShardArrMeta {
+    pub fn new(filter: DiskCache) -> Self{
+        let len = match filter {
+            DiskCache::C1 => STATIC_VECTOR_LENGTH_OUTER,
+            DiskCache::C2 => STATIC_VECTOR_LENGTH_INNER,
+        };
+
+        let mut key_count: HashMap<u32, u64> =
+            HashMap::with_capacity(len);
+        let mut bit_length: HashMap<u32, u64> =
+            HashMap::with_capacity(len);
+
+        for partition in 0..len as u32 {
             key_count.insert(partition , 0);
             bit_length.insert(partition, BLOOM_DEFAULT_LENGTH as u64);
         }
@@ -403,15 +472,40 @@ enum CollisionResult {
     Error,
 }
 
+struct PerfectBloomFilterFlags {
+    dynamic: bool,
+    false_positive_rate: FpRateLevel,       // Enum for false positive rate tolerance
+    data_volume: DataVolumeLevel,           // Enum for data set size
+    upper_bound: i64,                       // Max keys expected for systems current lifetime
+}
+
+enum FpRateLevel {
+  LOW,
+  MEDIUM,
+  HIGH,
+}
+
+enum DataVolumeLevel {
+  LOW,
+  MEDIUM,
+  HIGH,
+}
+
+async fn delete_files() {
+    fs::remove_dir("./pbf_data").await.unwrap()
+}
+
 
 
 #[cfg(test)]
 mod tests {
     use crate::shard_vec::PerfectBloomFilter;
+    use std::fs;
     use std::{fs::OpenOptions};
     use std::io::Write;
 
-    #[tokio::test]
+    /*
+     #[tokio::test]
     async fn test_filterb() {
         let temp_key1 = "First_Value".to_string(); // false
         let temp_key2 = "First_Value".to_string(); // true
@@ -436,6 +530,10 @@ mod tests {
         assert_eq!(result_e, true);
         assert_eq!(result_f, false);
     }
+    
+     */
+
+   
 
     // inner blooms sized ar 2^20 returns a false negative at 22 million
     // rasie this to 2^22 and we get false positive a 550 million
@@ -444,7 +542,7 @@ mod tests {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
-        let count = 1_000_000;
+        let count = 20_000_000;
         let mut pf = PerfectBloomFilter::new().unwrap();
         
 

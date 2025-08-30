@@ -29,3 +29,11 @@ Dynamically scalable cascading multidimensional bloom filter
 
 
 </details>
+
+
+
+constructor flags
+  .dynamic(true or false) //dynamic rescaling or no? thie requiores disk space allocation to work
+  .false_positive_rate(low, medium, high) // low false positive rate = more memoy overhead, more accurate results; medium is the middle gorund; high = less memory overhead, less acucrate results
+  .data_volume(low, medium, high) // low uses less memory but supports smaller data sets, medium is the middle ground; high uses more memory but handles larger datasets
+  .upper_bound(i64) // allows user to enter a starting preset key upper bound to minimize initialization alocations overhead; key does not have to be upper bounded to your systems lifetime but rather it's current state; if unsure then don't use this flag, if used wrong you can accidentally allocate more memory than needed.
