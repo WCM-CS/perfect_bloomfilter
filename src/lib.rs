@@ -1,9 +1,12 @@
 
 use bitvec::{bitvec, vec::BitVec};
+use bumpalo::Bump;
+use bumpalo_herd::{Herd, Member};
 use tokio::{fs, io::AsyncWriteExt, sync::{Mutex, RwLock}, time::sleep};
 use tracing_subscriber::layer::Filter;
-use std::{collections::HashMap, io::Cursor, ops::Deref, sync::Arc, time::Duration};
+use std::{array, collections::HashMap, io::Cursor, ops::Deref, sync::Arc, time::Duration};
 use anyhow::{anyhow, Result};
+use bumpalo::collections::Vec as BumpVec;
 
 
 
@@ -23,46 +26,76 @@ pub const STATIC_VECTOR_LENGTH_INNER: usize = 8192;
 
 
 // 14: 28.2 MB, 3_611_198 Keys before fail 
-// 15: 53.3 MB
+// 15: 53.3 MB, 7_488_904
+// 16: 103.7 MB, 13_833_485 
+// 17:  22_777_677  427 MB with file io overhead, 230 without file io
+// 18: 50_395_907
 
 
-
-static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
-static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
+static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(18)) as usize;
+static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(18)) as usize;
 
 pub enum FilterType {
     Outer,
     Inner
 }
 
-struct PerfectBloomFilter {
-    outer_filter: Arc<OuterBlooms>,
+struct PerfectBloomFilter<'a> {
+    herd: Arc<Herd>,
+    outer_filter: Arc<OuterBlooms<'a>>,
     inner_filter: Arc<InnerBlooms>
 }
 
-impl PerfectBloomFilter {
+impl<'a> PerfectBloomFilter<'a> {
     pub fn new() -> Result<Self> {
-        let outer_filter = Arc::new(OuterBlooms::new());
+
+        let herd = Arc::new(Herd::new());
+        
+        let outer_filter = Arc::new(OuterBlooms::new(&herd.get()));
         let inner_filter = Arc::new(InnerBlooms::new());
 
+        let drain_outer_filter = Arc::clone(&outer_filter);
+        let drain_inner_filter = Arc::clone(&inner_filter);
 
-        Ok( Self { outer_filter, inner_filter })
+
+        // Drain threads
+        tokio::spawn(async move{
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                let mut locked_outer_filter = drain_outer_filter.outer_disk_cache.lock().await;
+                let data = std::mem::take(&mut *locked_outer_filter);
+
+                drop(locked_outer_filter);
+
+                let _ = write_disk_io_cache(data, FilterType::Outer).await;
+            }
+            
+        });
+
+        tokio::spawn(async move{
+
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                let mut locked_inner_filter = drain_inner_filter.inner_disk_cache.lock().await;
+                let data = std::mem::take(&mut *locked_inner_filter);
+
+                drop(locked_inner_filter);
+
+                let _ = write_disk_io_cache(data, FilterType::Inner).await;
+
+            }
+            
+        });
+
+
+
+        Ok( Self { herd, outer_filter, inner_filter })
     }
 
     // returns true if the value exists in the set, returns false if it does not, this function also inserts the value does not already exist
     pub async fn contains_insert(&mut self, key: &str) -> Result<bool> {
-        // sync method:: 2M keys: 180.10 seconds 
         let outer_res = self.outer_filter.contains_and_insert(key).await?;
         let inner_res = self.inner_filter.contains_and_insert(key).await?;
-
-        // light concurrency: 2M keys: 181.70 seconds
-        /*
-        let (outer_res, inner_res) = tokio::join!(
-            self.outer_filter.contains_and_insert(key),
-            self.inner_filter.contains_and_insert(key)
-        );
-         */
-        
 
         Ok(outer_res && inner_res)
     }
@@ -72,25 +105,64 @@ impl PerfectBloomFilter {
 
 
 
-pub struct OuterBlooms {
-    outer_shards: Arc<RwLock<OuterShardArray>>,
+pub struct OuterBlooms<'h> {
+    outer_shards: Arc<RwLock<OuterShardVec<'h>>>,
     outer_metadata: Arc<RwLock<OuterMetaData>>,
     outer_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
 }
 
-impl OuterBlooms  {
-    pub fn new() -> Self {
-        let outer_shards = Arc::new(RwLock::new(OuterShardArray::default()));
+impl<'h> OuterBlooms<'h>  {
+    pub fn new(member: &'h Member<'h>) -> Self {
+        let outer_shards = Arc::new(RwLock::new(OuterShardVec::new(member)));
         let outer_metadata = Arc::new(RwLock::new(OuterMetaData::default()));
         let outer_disk_cache = Arc::new(Mutex::new(HashMap::new()));
 
         Self {outer_shards, outer_metadata, outer_disk_cache}
     }
 
+}
+
+pub struct InnerBlooms {
+    inner_shards: Arc<RwLock<InnerShardArray>>,
+    inner_metadata: Arc<RwLock<InnerMetaData>>,
+    inner_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
+}
+
+impl InnerBlooms  {
+    pub fn new() -> Self {
+        let inner_shards = Arc::new(RwLock::new(InnerShardArray::default()));
+        let inner_metadata = Arc::new(RwLock::new(InnerMetaData::default()));
+        let inner_disk_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Self {inner_shards, inner_metadata, inner_disk_cache}
+    }
+
+ 
+}
+
+#[async_trait::async_trait]
+pub trait BloomFilter {
+    type CollisionResult;
+
+    async fn contains_and_insert(&self, key: &str) -> Result<bool>;
+    async fn bloom_hash(&self, vector_partitions: &Vec<u32>,key: &str) -> Result<HashMap<u32, Vec<u64>>>;
+    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<Self::CollisionResult>;
+    async fn bloom_insert(&self, inner_hashed: &HashMap<u32, Vec<u64>>);
+    async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>>;
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>>;
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()>;
+
+}
+
+#[async_trait::async_trait]
+impl BloomFilter for OuterBlooms {
+    type CollisionResult = OuterCollisionResult;
+
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let outer_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
         let outer_blooms_idx = self.bloom_hash(&outer_shard_slots, key).await?;
         let outer_collision_result = self.bloom_check(&outer_blooms_idx).await?;
+
 
         let outer_exists = match outer_collision_result {
             OuterCollisionResult::Zero => {
@@ -110,10 +182,10 @@ impl OuterBlooms  {
             }
         };
 
+        self.insert_disk_io_cache(key, outer_shard_slots).await?;
 
         Ok(outer_exists)
     }
-
 
     async fn bloom_hash(&self, vector_partitions: &Vec<u32>,key: &str) -> Result<HashMap<u32, Vec<u64>>> {
         let mut inner_hash_list = HashMap::new();
@@ -141,7 +213,7 @@ impl OuterBlooms  {
             inner_hash_list.insert(vector_slot, key_hashes);
         }
         Ok(inner_hash_list)
-    }       
+    }   
 
     async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<OuterCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
@@ -159,11 +231,11 @@ impl OuterBlooms  {
         Ok(collision_result)
     }
 
-    pub async fn bloom_insert(&self, inner_hashed: &HashMap<u32, Vec<u64>>) {
+    async fn bloom_insert(&self, outer_hashed: &HashMap<u32, Vec<u64>>) {
         let mut inner = self.outer_shards.write().await;
         let mut inner_met = self.outer_metadata.write().await;
 
-        for (vector_index, hashes) in inner_hashed {
+        for (vector_index, hashes) in outer_hashed {
             hashes.iter().for_each(|&bloom_index| {
                 inner.data[*vector_index as usize].set(bloom_index as usize, true)
             });
@@ -198,24 +270,29 @@ impl OuterBlooms  {
         Ok(vec![p1, p2])
     }
 
-
-
-}
-
-pub struct InnerBlooms {
-    inner_shards: Arc<RwLock<InnerShardArray>>,
-    inner_metadata: Arc<RwLock<InnerMetaData>>,
-    inner_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
-}
-
-impl InnerBlooms  {
-    pub fn new() -> Self {
-        let inner_shards = Arc::new(RwLock::new(InnerShardArray::default()));
-        let inner_metadata = Arc::new(RwLock::new(InnerMetaData::default()));
-        let inner_disk_cache = Arc::new(Mutex::new(HashMap::new()));
-
-        Self {inner_shards, inner_metadata, inner_disk_cache}
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>> {
+        let mut locked_cache = self.outer_disk_cache.lock().await;
+        let data = std::mem::take(&mut *locked_cache); // deref the mutex guaard to take ownership and drain cache
+        Ok(data)
     }
+
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+        let mut inner = self.outer_disk_cache.lock().await;
+     
+        for idx in shards_idx {
+            inner
+                .entry(idx)
+                .or_default()
+                .push(key.to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BloomFilter for InnerBlooms {
+    type CollisionResult = InnerCollisionResult;
 
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let inner_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
@@ -224,18 +301,16 @@ impl InnerBlooms  {
 
         let inner_exists = match inner_collision_result {
             InnerCollisionResult::Zero => {
-                self.bloom_insert(&inner_blooms_idx).await;
+                self.bloom_insert(&inner_blooms_idx).await; 
                 false
             }
             InnerCollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&inner_blooms_idx).await;
-               
                 false
             }
             InnerCollisionResult::PartialMajor(s1, s2) => {
                 tracing::info!("INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
                 self.bloom_insert(&inner_blooms_idx).await;
-               
                 false
             }
             InnerCollisionResult::Complete(s1,s2, s3) => {
@@ -246,6 +321,8 @@ impl InnerBlooms  {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
+
+        self.insert_disk_io_cache(key, inner_shard_slots).await?;
 
         Ok(inner_exists)
     }
@@ -276,7 +353,8 @@ impl InnerBlooms  {
             inner_hash_list.insert(vector_slot, key_hashes);
         }
         Ok(inner_hash_list)
-    }      
+    }   
+
 
     async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<InnerCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
@@ -311,7 +389,6 @@ impl InnerBlooms  {
         }
     }
 
-
     async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
         // two shards: jump hash p1 and use n/2 mod shard len
         // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
@@ -334,34 +411,78 @@ impl InnerBlooms  {
 
         Ok(vec![p1, p2, p3])
     }
+
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>> {
+        let mut locked_cache = self.inner_disk_cache.lock().await;
+        let data = std::mem::take(&mut *locked_cache); // deref the mutex guaard to take ownership and drain cache
+        Ok(data)
+    }
+
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+        let mut inner = self.inner_disk_cache.lock().await;
+     
+        for idx in shards_idx {
+            inner
+                .entry(idx)
+                .or_default()
+                .push(key.to_string());
+        }
+
+        Ok(())
+    }
+
 }
 
 
 
-
-#[derive(Debug)]
-struct OuterShardArray {
-    data: [BitVec; STATIC_VECTOR_LENGTH_OUTER],
+struct OuterShardVec<'h> {
+    data: BumpVec<'h, ArenaBloom<'h>>,
+    member: Arc<Mutex<Member<'h>>>,
 }
 
-impl Default for OuterShardArray {
-    fn default() -> Self {
-        let empty_bitvec = bitvec![0; OUTER_BLOOM_DEFAULT_LENGTH];
-        let data = std::array::from_fn(|_| empty_bitvec.clone());
-        OuterShardArray { data }
+impl<'h> OuterShardVec<'h> {
+    fn new(member: Arc<Mutex<Member<'h>>>) -> Self {
+
+        let bump = {
+            let guard = member.lock().unwrap();
+            guard.as_bump()
+        };
+        let mut data = BumpVec::new_in(bump);
+
+        for _ in 0.. STATIC_VECTOR_LENGTH_OUTER {
+            let bitvec = bitvec![0; OUTER_BLOOM_DEFAULT_LENGTH];
+            data.push(ArenaBloom { bitvec });
+        }
+
+        OuterShardVec { data, member }
     }
 }
 
 #[derive(Debug)]
-struct InnerShardArray {
-    data: [BitVec; STATIC_VECTOR_LENGTH_INNER],
+struct ArenaBloom<'h> {
+    bitvec: BitVec,
 }
 
-impl Default for InnerShardArray {
-    fn default() -> Self {
-        let empty_bitvec = bitvec![0; INNER_BLOOM_DEFAULT_LENGTH];
-        let data = std::array::from_fn(|_| empty_bitvec.clone());
-        InnerShardArray { data }
+#[derive(Debug)]
+struct InnerShardVec<'h> {
+    data: BumpVec<'h, ArenaBloom<'h>>,
+    herd: Arc<Herd>,
+}
+
+impl<'h> InnerShardVec<'h> {
+    fn new(herd: Arc<Herd>) -> Self {
+        let arena = herd.get();
+
+        // Create a bump-allocated Vec inside the arena
+        let mut data = BumpVec::new_in(&arena);
+
+        for _ in 0..STATIC_VECTOR_LENGTH_INNER {
+            let arena = herd.get();
+            let bitvec = bitvec![0; INNER_BLOOM_DEFAULT_LENGTH];
+            data.push(ArenaBloom { arena, bitvec });
+        }
+
+        OuterShardVec { data, herd }
     }
 }
 
@@ -508,6 +629,40 @@ pub fn inner_check_collision(map: &HashMap<u32, bool>) -> Result<InnerCollisionR
 }
 
 
+async fn write_disk_io_cache(data: HashMap<u32, Vec<String>>, cache_type: FilterType) -> Result<()> {
+    let node = match cache_type {
+        FilterType::Outer => "outer",
+        FilterType::Inner => "inner"
+    };
+
+
+    for (shard, keys) in data.into_iter() {
+        if let Some(parent) = std::path::Path::new("./pbf_data/init.txt").parent() {
+            fs::create_dir_all(parent).await?;  // Create directory if it does not exist
+        }
+        let file_name = format!("./pbf_data/{}_{}.txt", node, shard);
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_name)
+            .await?;
+
+        let mut writer = tokio::io::BufWriter::new(file);
+
+        for k in keys {
+            writer.write_all(k.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+        }
+
+        writer.flush().await?;
+    };
+
+
+    Ok(())
+
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -523,7 +678,7 @@ mod tests {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
-        let count = 2_000_000_000;
+        let count = 2_000;
         let mut pf = PerfectBloomFilter::new()?;
         
 

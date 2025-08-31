@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
+array-init = "2.1.0"
+async-trait = "0.1.89"
 bitvec = "1.0.1"
+bumpalo = { version = "3.19.0", features = ["collections", "boxed", "serde"] }
+bumpalo-herd = "0.1.2"
 murmur3 = "0.5.2"
 rusqlite = "0.37.0"
 tokio = { version = "1.37", features = ["full"] }
