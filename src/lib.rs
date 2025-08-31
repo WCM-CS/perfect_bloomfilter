@@ -87,10 +87,48 @@ impl OuterBlooms  {
         Self {outer_shards, outer_metadata, outer_disk_cache}
     }
 
+}
+
+pub struct InnerBlooms {
+    inner_shards: Arc<RwLock<InnerShardArray>>,
+    inner_metadata: Arc<RwLock<InnerMetaData>>,
+    inner_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
+}
+
+impl InnerBlooms  {
+    pub fn new() -> Self {
+        let inner_shards = Arc::new(RwLock::new(InnerShardArray::default()));
+        let inner_metadata = Arc::new(RwLock::new(InnerMetaData::default()));
+        let inner_disk_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Self {inner_shards, inner_metadata, inner_disk_cache}
+    }
+
+}
+
+#[async_trait::async_trait]
+pub trait BloomFilter {
+    type CollisionResult;
+
+    async fn contains_and_insert(&self, key: &str) -> Result<bool>;
+    async fn bloom_hash(&self, vector_partitions: &Vec<u32>,key: &str) -> Result<HashMap<u32, Vec<u64>>>;
+    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<Self::CollisionResult>;
+    async fn bloom_insert(&self, inner_hashed: &HashMap<u32, Vec<u64>>);
+    async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>>;
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>>;
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()>;
+
+}
+
+#[async_trait::async_trait]
+impl BloomFilter for OuterBlooms {
+    type CollisionResult = OuterCollisionResult;
+
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let outer_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
         let outer_blooms_idx = self.bloom_hash(&outer_shard_slots, key).await?;
         let outer_collision_result = self.bloom_check(&outer_blooms_idx).await?;
+
 
         let outer_exists = match outer_collision_result {
             OuterCollisionResult::Zero => {
@@ -110,10 +148,10 @@ impl OuterBlooms  {
             }
         };
 
+        self.insert_disk_io_cache(key, outer_shard_slots).await?;
 
         Ok(outer_exists)
     }
-
 
     async fn bloom_hash(&self, vector_partitions: &Vec<u32>,key: &str) -> Result<HashMap<u32, Vec<u64>>> {
         let mut inner_hash_list = HashMap::new();
@@ -141,7 +179,7 @@ impl OuterBlooms  {
             inner_hash_list.insert(vector_slot, key_hashes);
         }
         Ok(inner_hash_list)
-    }       
+    }   
 
     async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<OuterCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
@@ -159,11 +197,11 @@ impl OuterBlooms  {
         Ok(collision_result)
     }
 
-    pub async fn bloom_insert(&self, inner_hashed: &HashMap<u32, Vec<u64>>) {
+    async fn bloom_insert(&self, outer_hashed: &HashMap<u32, Vec<u64>>) {
         let mut inner = self.outer_shards.write().await;
         let mut inner_met = self.outer_metadata.write().await;
 
-        for (vector_index, hashes) in inner_hashed {
+        for (vector_index, hashes) in outer_hashed {
             hashes.iter().for_each(|&bloom_index| {
                 inner.data[*vector_index as usize].set(bloom_index as usize, true)
             });
@@ -198,24 +236,29 @@ impl OuterBlooms  {
         Ok(vec![p1, p2])
     }
 
-
-
-}
-
-pub struct InnerBlooms {
-    inner_shards: Arc<RwLock<InnerShardArray>>,
-    inner_metadata: Arc<RwLock<InnerMetaData>>,
-    inner_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
-}
-
-impl InnerBlooms  {
-    pub fn new() -> Self {
-        let inner_shards = Arc::new(RwLock::new(InnerShardArray::default()));
-        let inner_metadata = Arc::new(RwLock::new(InnerMetaData::default()));
-        let inner_disk_cache = Arc::new(Mutex::new(HashMap::new()));
-
-        Self {inner_shards, inner_metadata, inner_disk_cache}
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>> {
+        let mut locked_cache = self.outer_disk_cache.lock().await;
+        let data = std::mem::take(&mut *locked_cache); // deref the mutex guaard to take ownership and drain cache
+        Ok(data)
     }
+
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+        let mut inner = self.outer_disk_cache.lock().await;
+     
+        for idx in shards_idx {
+            inner
+                .entry(idx)
+                .or_default()
+                .push(key.to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BloomFilter for InnerBlooms {
+    type CollisionResult = InnerCollisionResult;
 
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let inner_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
@@ -224,18 +267,16 @@ impl InnerBlooms  {
 
         let inner_exists = match inner_collision_result {
             InnerCollisionResult::Zero => {
-                self.bloom_insert(&inner_blooms_idx).await;
+                self.bloom_insert(&inner_blooms_idx).await; 
                 false
             }
             InnerCollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&inner_blooms_idx).await;
-               
                 false
             }
             InnerCollisionResult::PartialMajor(s1, s2) => {
                 tracing::info!("INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
                 self.bloom_insert(&inner_blooms_idx).await;
-               
                 false
             }
             InnerCollisionResult::Complete(s1,s2, s3) => {
@@ -246,6 +287,8 @@ impl InnerBlooms  {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
+
+        self.insert_disk_io_cache(key, inner_shard_slots).await?;
 
         Ok(inner_exists)
     }
@@ -276,7 +319,8 @@ impl InnerBlooms  {
             inner_hash_list.insert(vector_slot, key_hashes);
         }
         Ok(inner_hash_list)
-    }      
+    }   
+
 
     async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<InnerCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
@@ -311,7 +355,6 @@ impl InnerBlooms  {
         }
     }
 
-
     async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
         // two shards: jump hash p1 and use n/2 mod shard len
         // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
@@ -334,6 +377,26 @@ impl InnerBlooms  {
 
         Ok(vec![p1, p2, p3])
     }
+
+    async fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>> {
+        let mut locked_cache = self.inner_disk_cache.lock().await;
+        let data = std::mem::take(&mut *locked_cache); // deref the mutex guaard to take ownership and drain cache
+        Ok(data)
+    }
+
+    async fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+        let mut inner = self.inner_disk_cache.lock().await;
+     
+        for idx in shards_idx {
+            inner
+                .entry(idx)
+                .or_default()
+                .push(key.to_string());
+        }
+
+        Ok(())
+    }
+
 }
 
 
@@ -523,7 +586,7 @@ mod tests {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
-        let count = 2_000;
+        let count = 20_000;
         let mut pf = PerfectBloomFilter::new()?;
         
 
