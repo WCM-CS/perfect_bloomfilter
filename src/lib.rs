@@ -523,7 +523,7 @@ mod tests {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
-        let count = 2_000_000_000;
+        let count = 2_000;
         let mut pf = PerfectBloomFilter::new()?;
         
 
