@@ -7,21 +7,28 @@ use anyhow::{anyhow, Result};
 
 
 
-pub const HASH_SEED_SELECTION: [u32; 5] = [9, 223, 372, 630, 854];
+pub const HASH_SEED_SELECTION: [u32; 6] = [9, 223, 372, 530, 775, 954];
 
 
-const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 10;
-const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 20;
+const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
+const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 
 pub const STATIC_VECTOR_LENGTH_OUTER: usize = 4096;
 pub const STATIC_VECTOR_LENGTH_INNER: usize = 8192;
 
 // 14, 12 = 400_000 keys, 16 MB mem
-// 16, 14 = 2_454_000 keys, 53.2 MB mem
-// 18, 16 = 12_620937, 204.3 MB
-// 20, 18 = 825 MB
-static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(20)) as usize;
-static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(18)) as usize;
+// 16, 14 = 2_454_096 keys, 53.2 MB mem   // this could be a solid starting point now using 6M keys per 53.1MB
+// 18, 16 = 12_620_937, 204.3 MB
+// 20, 18 = 44_587_519, 825 MB
+
+
+// 14: 28.2 MB, 3_611_198 Keys before fail 
+// 15: 53.3 MB
+
+
+
+static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
+static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
 
 pub enum FilterType {
     Outer,
@@ -42,6 +49,7 @@ impl PerfectBloomFilter {
         Ok( Self { outer_filter, inner_filter })
     }
 
+    // returns true if the value exists in the set, returns false if it does not, this function also inserts the value does not already exist
     pub async fn contains_insert(&mut self, key: &str) -> Result<bool> {
         // sync method:: 2M keys: 180.10 seconds 
         let outer_res = self.outer_filter.contains_and_insert(key).await?;
@@ -80,31 +88,24 @@ impl OuterBlooms  {
     }
 
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
-        let outer_shard_slots = array_partition_hash(key, FilterType::Outer).await?; // get the outer blooms three shard idx
+        let outer_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
         let outer_blooms_idx = self.bloom_hash(&outer_shard_slots, key).await?;
         let outer_collision_result = self.bloom_check(&outer_blooms_idx).await?;
 
         let outer_exists = match outer_collision_result {
-            CollisionResult::Zero => {
+            OuterCollisionResult::Zero => {
                 self.bloom_insert(&outer_blooms_idx).await;
                 false
             }
-             CollisionResult::PartialMinor(_) => {
+            OuterCollisionResult::Partial(_) => {
                 self.bloom_insert(&outer_blooms_idx).await;
-               
                 false
             }
-            CollisionResult::PartialMajor(s1, s2) => {
-                tracing::info!("Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
-                self.bloom_insert(&outer_blooms_idx).await;
-               
-                false
-            }
-            CollisionResult::Complete(s1,s2, s3) => {
-                tracing::info!("Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}", s1, s2, s3, key);
+            OuterCollisionResult::Complete(s1,s2) => {
+                tracing::info!("OUTER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} Value: {}", s1, s2, key);
                 true
             }
-            CollisionResult::Error => {
+            OuterCollisionResult::Error => {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
@@ -126,9 +127,9 @@ impl OuterBlooms  {
 
             let mut key_hashes = Vec::with_capacity(OUTER_BLOOM_HASH_FAMILY_SIZE as usize);
             let h1 =
-                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])?;
+                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[0])?;
             let h2 =
-                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[4])?;
+                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[1])?;
 
             for idx in 0..OUTER_BLOOM_HASH_FAMILY_SIZE {
                 let idx_u128 = idx as u128;
@@ -142,7 +143,7 @@ impl OuterBlooms  {
         Ok(inner_hash_list)
     }       
 
-    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<CollisionResult> {
+    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<OuterCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
         let inner = self.outer_shards.read().await;
 
@@ -153,7 +154,7 @@ impl OuterBlooms  {
             collision_map.insert(*index, key_exists);
         }
 
-        let collision_result = check_collision(&collision_map)?;
+        let collision_result = outer_check_collision(&collision_map)?;
 
         Ok(collision_result)
     }
@@ -173,6 +174,28 @@ impl OuterBlooms  {
                 .and_modify(|count| *count += 1)
                 .or_insert(1);
         }
+    }
+
+    async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
+        // two shards: jump hash p1 and use n/2 mod shard len
+        // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
+
+        let shard_len: u32 = STATIC_VECTOR_LENGTH_OUTER as u32;
+
+        let h1 =
+            murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])?;
+
+        let high = (h1 >> 64) as u64;
+        let low = h1 as u64;
+        let shard_size = shard_len / 2;
+
+        let p1 = jump_hash_partition(low ^ high, shard_len as u32)?;
+        let p2 = (p1 + shard_size) % shard_len as u32;
+        
+        
+        debug_assert!(p1 != p2, "Partitions must be unique");
+
+        Ok(vec![p1, p2])
     }
 
 
@@ -195,31 +218,31 @@ impl InnerBlooms  {
     }
 
     async fn contains_and_insert(&self, key: &str) -> Result<bool> {
-        let inner_shard_slots = array_partition_hash(key, FilterType::Inner).await?; // get the outer blooms three shard idx
+        let inner_shard_slots = self.array_partition_hash(key).await?; // get the outer blooms three shard idx
         let inner_blooms_idx = self.bloom_hash(&inner_shard_slots, key).await?;
         let inner_collision_result = self.bloom_check(&inner_blooms_idx).await?;
 
         let inner_exists = match inner_collision_result {
-            CollisionResult::Zero => {
+            InnerCollisionResult::Zero => {
                 self.bloom_insert(&inner_blooms_idx).await;
                 false
             }
-             CollisionResult::PartialMinor(_) => {
-                self.bloom_insert(&inner_blooms_idx).await;
-               
-                false
-            }
-            CollisionResult::PartialMajor(s1, s2) => {
-                tracing::info!("Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
+            InnerCollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&inner_blooms_idx).await;
                
                 false
             }
-            CollisionResult::Complete(s1,s2, s3) => {
-                tracing::info!("Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}", s1, s2, s3, key);
+            InnerCollisionResult::PartialMajor(s1, s2) => {
+                tracing::info!("INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}", s1, s2, key);
+                self.bloom_insert(&inner_blooms_idx).await;
+               
+                false
+            }
+            InnerCollisionResult::Complete(s1,s2, s3) => {
+                tracing::info!("INNER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}", s1, s2, s3, key);
                 true
             }
-            CollisionResult::Error => {
+            InnerCollisionResult::Error => {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
@@ -239,12 +262,12 @@ impl InnerBlooms  {
 
             let mut key_hashes = Vec::with_capacity(INNER_BLOOM_HASH_FAMILY_SIZE as usize);
             let h1 =
-                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])?;
+                murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[3])?;
             let h2 =
                 murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[4])?;
 
             for idx in 0..INNER_BLOOM_HASH_FAMILY_SIZE {
-                let idx_u128 = idx as u128;
+                let idx_u128 = idx as u128; // potentially add a prime number here to ensure its a solid dirtibution in the shards
                 let index = (h1.wrapping_add(idx_u128.wrapping_mul(h2))) % bloom_length as u128;
 
                 key_hashes.push(index as u64)
@@ -255,7 +278,7 @@ impl InnerBlooms  {
         Ok(inner_hash_list)
     }      
 
-    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<CollisionResult> {
+    async fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<InnerCollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
         let inner = self.inner_shards.read().await;
 
@@ -266,7 +289,7 @@ impl InnerBlooms  {
             collision_map.insert(*index, key_exists);
         }
 
-        let collision_result = check_collision(&collision_map)?;
+        let collision_result = inner_check_collision(&collision_map)?;
 
         Ok(collision_result)
     } 
@@ -286,6 +309,30 @@ impl InnerBlooms  {
                 .and_modify(|count| *count += 1)
                 .or_insert(1);
         }
+    }
+
+
+    async fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
+        // two shards: jump hash p1 and use n/2 mod shard len
+        // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
+
+        let shard_len: u32 = STATIC_VECTOR_LENGTH_INNER as u32;
+
+        let h1 =
+            murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[5])?;
+
+        let high = (h1 >> 64) as u64;
+        let low = h1 as u64;
+        let shard_size = shard_len / 3;
+
+        let p1 = jump_hash_partition(high ^ low, shard_len as u32)?;
+        let p2 = (p1 + shard_size) % shard_len as u32;
+        let p3 = (p1 + (2 * shard_size)) % shard_len as u32;
+        
+        
+        debug_assert!(p1 != p2 && p1 != p3 && p2 != p3, "Partitions must be unique");
+
+        Ok(vec![p1, p2, p3])
     }
 }
 
@@ -381,34 +428,11 @@ impl InnerMetaData {
 }
 
 
-pub async fn array_partition_hash(key: &str, shard: FilterType) -> Result<Vec<u32>> {
-    // two shards: jump hash p1 and use n/2 mod shard len
-    // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
 
-    let shard_len: u32 = match shard {
-        FilterType::Outer => STATIC_VECTOR_LENGTH_OUTER as u32,
-        FilterType::Inner => STATIC_VECTOR_LENGTH_INNER as u32,
-    };
 
-    let h1 =
-        murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[3])?;
 
-    let high = (h1 >> 64) as u64;
-    let low = h1 as u64;
-    let shard_size = shard_len / 3;
-
-    let p1 = jump_hash_partition(high ^ low, shard_len as u32)?;
-    let p2 = (p1 + shard_size) % shard_len as u32;
-    let p3 = (p1 + (2 * shard_size)) % shard_len as u32;
-    
-    
-    debug_assert!(p1 != p2 && p1 != p3 && p2 != p3, "Partitions must be unique");
-
-    Ok(vec![p1, p2, p3])
-}
-
-    // JumpConsistentHash function, rewritten from the jave implementation
-    // Link to the repo: https://github.com/ssedano/jump-consistent-hash/blob/master/src/main/java/com/github/ssedano/hash/JumpConsistentHash.java
+// JumpConsistentHash function, rewritten from the jave implementation
+// Link to the repo: https://github.com/ssedano/jump-consistent-hash/blob/master/src/main/java/com/github/ssedano/hash/JumpConsistentHash.java
 fn jump_hash_partition(key: u64, buckets: u32) -> Result<u32> {
     let mut b: i128 = -1;
     let mut j: i128 = 0;
@@ -429,7 +453,14 @@ fn jump_hash_partition(key: u64, buckets: u32) -> Result<u32> {
     Ok(b as u32)
 }
 
-pub enum CollisionResult {
+pub enum OuterCollisionResult {
+    Zero,
+    Partial(u32),
+    Complete(u32, u32),
+    Error,
+}
+
+pub enum InnerCollisionResult {
     Zero,
     PartialMinor(u32),
     PartialMajor(u32, u32),
@@ -437,7 +468,7 @@ pub enum CollisionResult {
     Error,
 }
 
-pub fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
+pub fn outer_check_collision(map: &HashMap<u32, bool>) -> Result<OuterCollisionResult> {
     let mut collided = vec![];
 
     map.iter().for_each(|(vector_indx, boolean)| {
@@ -447,11 +478,30 @@ pub fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
     });
 
     let collision_result = match collided.as_slice() {
-        [] => CollisionResult::Zero,
-        [one] => CollisionResult::PartialMinor(**one),
-        [one, two] => CollisionResult::PartialMajor(**one, **two),
-        [one, two, three] => CollisionResult::Complete(**one, **two, **three),
-        _ => CollisionResult::Error,
+        [] => OuterCollisionResult::Zero,
+        [one] => OuterCollisionResult::Partial(**one),
+        [one, two] => OuterCollisionResult::Complete(**one, **two),
+        _ => OuterCollisionResult::Error,
+    };
+
+    Ok(collision_result)
+}
+
+pub fn inner_check_collision(map: &HashMap<u32, bool>) -> Result<InnerCollisionResult> {
+    let mut collided = vec![];
+
+    map.iter().for_each(|(vector_indx, boolean)| {
+        if *boolean {
+            collided.push(vector_indx)
+        }
+    });
+
+    let collision_result = match collided.as_slice() {
+        [] => InnerCollisionResult::Zero,
+        [one] => InnerCollisionResult::PartialMinor(**one),
+        [one, two] => InnerCollisionResult::PartialMajor(**one, **two),
+        [one, two, three] => InnerCollisionResult::Complete(**one, **two, **three),
+        _ => InnerCollisionResult::Error,
     };
 
     Ok(collision_result)
@@ -469,24 +519,20 @@ mod tests {
 
 
   #[tokio::test]
-    async fn test_filter_loop_a()  {
+    async fn test_filter_loop_a() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
         let count = 2_000_000_000;
-        let mut pf = PerfectBloomFilter::new().unwrap();
+        let mut pf = PerfectBloomFilter::new()?;
         
 
         tracing::info!("Starting Insert phase 1");
         for i in 0..count {
             let key = i.to_string();
-
-            let was_present = {
-                pf
-                    .contains_insert(&key)
-                    .await
-                    .expect("Insert failed unexpectedly")
-            };
+            let was_present = pf
+                .contains_insert(&key)
+                .await?;
 
             assert_eq!(was_present, false);
         }
@@ -498,12 +544,13 @@ mod tests {
             let key = i.to_string();
             let was_present = pf
                 .contains_insert(&key)
-                .await
-                .expect("Insert failed unexpectedly");
+                .await?;
 
             assert_eq!(was_present, true);
         }
         tracing::info!("Completed confirmation phase 1");
+
+        Ok(())
 
     }
 }
