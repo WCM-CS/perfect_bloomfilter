@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use bitvec::{bitvec, vec::BitVec};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Cursor, Write},
     sync::{Arc, Mutex, RwLock},
@@ -18,16 +18,13 @@ const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 pub const STATIC_VECTOR_LENGTH_OUTER: usize = 4096;
 pub const STATIC_VECTOR_LENGTH_INNER: usize = 8192;
 
-// 14, 12 = 400_000 keys, 16 MB mem
-// 16, 14 = 2_454_096 keys, 53.2 MB mem   // this could be a solid starting point now using 6M keys per 53.1MB
-// 18, 16 = 12_620_937, 204.3 MB
-// 20, 18 = 44_587_519, 825 MB
+// x = 12: 97.5 MB, 1 M Keys passes, failed 2.5 M
+// x,y = 13, 12: 109.2 MB, 
+static OUTER_BLOOM_STARTING_X: u32 = 13;
+static INNER_BLOOM_STARTING_X: u32 = 12;
 
-// 14: 28.2 MB, 3_611_198 Keys before fail
-// 15: 53.3 MB 200_000 15
-
-static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
-static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow(15)) as usize;
+static OUTER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow( OUTER_BLOOM_STARTING_X )) as usize;
+static INNER_BLOOM_DEFAULT_LENGTH: usize = (2_u32.pow( INNER_BLOOM_STARTING_X )) as usize;
 
 pub enum FilterType {
     Outer,
@@ -41,46 +38,81 @@ struct PerfectBloomFilter {
 
 impl PerfectBloomFilter {
     pub fn new() -> Result<Self> {
-        let outer_filter = Arc::new(OuterBlooms::new());
-        let inner_filter = Arc::new(InnerBlooms::new());
+        let outer_filter = Arc::new(OuterBlooms::default());
+        let inner_filter = Arc::new(InnerBlooms::default());
 
         let drain_outer_filter = Arc::clone(&outer_filter);
         let drain_inner_filter = Arc::clone(&inner_filter);
         let resize_outer_filter = Arc::clone(&outer_filter);
-        let resize_inner_filter = Arc::clone(&inner_filter);
+        let resize_inner_filter = Arc::clone(&inner_filter); // either rehash on a partial or on a partial after x hits
 
-
-
-
-        let drain_pool = ThreadPool::new(2);
+        let (drain_threads, rehash_threads) = concurrecy_init()?;
+        let drain_pool = ThreadPool::new(drain_threads);
+        let rehash_pool = ThreadPool::new(rehash_threads);
 
         drain_pool.execute(move || {
             loop {
-                thread::sleep(Duration::from_secs(5));
-                let mut locked_outer_filter = drain_outer_filter.outer_disk_cache.lock().unwrap();
-                let data = std::mem::take(&mut *locked_outer_filter);
+                thread::sleep(Duration::from_secs(2));
+                
+                let data = {
+                    let mut locked_outer_filter = drain_outer_filter.outer_disk_cache.lock().unwrap();
+                    std::mem::take(&mut *locked_outer_filter)
+                };
 
-                drop(locked_outer_filter);
-
-                let _ = write_disk_io_cache(data, FilterType::Outer);
+                if let Err(e) = write_disk_io_cache(data, FilterType::Outer) {
+                    tracing::warn!("Failed to write keys from cache outer blooms to disk: {}", e);
+                }
             }
         });
 
         drain_pool.execute(move || {
             loop {
-                thread::sleep(Duration::from_secs(5));
-                let mut locked_inner_filter = drain_inner_filter.inner_disk_cache.lock().unwrap();
-                let data = std::mem::take(&mut *locked_inner_filter);
+                thread::sleep(Duration::from_secs(2));
 
-                drop(locked_inner_filter);
+                let data = {
+                    let mut locked_inner_filter = drain_inner_filter.inner_disk_cache.lock().unwrap();
+                    std::mem::take(&mut *locked_inner_filter)
+                };
 
-                let _ = write_disk_io_cache(data, FilterType::Inner);
+                if let Err(e) = write_disk_io_cache(data, FilterType::Inner) {
+                    tracing::warn!("Failed to write keys from cache inner blooms to disk: {}", e);
+                }
             }
         });
-
-
 
         
+        rehash_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+
+                let data = {
+                    let mut locked_outer_filter = resize_outer_filter.outer_rehash_list.lock().unwrap();
+                    std::mem::take(&mut *locked_outer_filter)
+                };
+
+            }
+        });
+
+        rehash_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+
+                let data = {
+                    let mut locked_outer_filter = resize_inner_filter.inner_rehash_list.lock().unwrap();
+                    std::mem::take(&mut *locked_outer_filter)
+                };
+
+            }
+        });
+         
+
+        
+          
+         
+
+
+
+      
 
         Ok(Self {
             outer_filter,
@@ -88,9 +120,9 @@ impl PerfectBloomFilter {
         })
     }
 
+    
 
     pub fn contains_insert(&mut self, key: &str) -> Result<bool> {
-        // sync method:: 2M keys: 180.10 seconds
         let outer_res = self.outer_filter.contains_and_insert(key)?;
         let inner_res = self.inner_filter.contains_and_insert(key)?;
 
@@ -98,7 +130,6 @@ impl PerfectBloomFilter {
     }
 
     pub async fn async_contains_insert(&mut self, key: &str) -> Result<bool> {
-        // sync method:: 2M keys: 180.10 seconds
         let outer_res = self.outer_filter.contains_and_insert(key)?;
         let inner_res = self.inner_filter.contains_and_insert(key)?;
 
@@ -109,7 +140,14 @@ impl PerfectBloomFilter {
 pub struct OuterBlooms {
     outer_shards: Arc<RwLock<OuterShardArray>>,
     outer_metadata: Arc<RwLock<OuterMetaData>>,
-    outer_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
+    outer_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>, //cache struct
+    outer_rehash_list: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl Default for OuterBlooms {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OuterBlooms {
@@ -117,11 +155,13 @@ impl OuterBlooms {
         let outer_shards = Arc::new(RwLock::new(OuterShardArray::default()));
         let outer_metadata = Arc::new(RwLock::new(OuterMetaData::default()));
         let outer_disk_cache = Arc::new(Mutex::new(HashMap::new()));
+        let outer_rehash_list = Arc::new(Mutex::new(HashSet::new()));
 
         Self {
             outer_shards,
             outer_metadata,
             outer_disk_cache,
+            outer_rehash_list,
         }
     }
 }
@@ -130,6 +170,13 @@ pub struct InnerBlooms {
     inner_shards: Arc<RwLock<InnerShardArray>>,
     inner_metadata: Arc<RwLock<InnerMetaData>>,
     inner_disk_cache: Arc<Mutex<HashMap<u32, Vec<String>>>>,
+    inner_rehash_list: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl Default for InnerBlooms {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InnerBlooms {
@@ -137,11 +184,13 @@ impl InnerBlooms {
         let inner_shards = Arc::new(RwLock::new(InnerShardArray::default()));
         let inner_metadata = Arc::new(RwLock::new(InnerMetaData::default()));
         let inner_disk_cache = Arc::new(Mutex::new(HashMap::new()));
+        let inner_rehash_list = Arc::new(Mutex::new(HashSet::new()));
 
         Self {
             inner_shards,
             inner_metadata,
             inner_disk_cache,
+            inner_rehash_list
         }
     }
 }
@@ -150,54 +199,69 @@ pub trait BloomFilter {
     type CollisionResult;
 
     fn contains_and_insert(&self, key: &str) -> Result<bool>;
-    fn bloom_hash(&self, vector_partitions: &Vec<u32>, key: &str)
-    -> Result<HashMap<u32, Vec<u64>>>;
+    fn bloom_hash(&self, vector_partitions: &[u32], key: &str) -> Result<HashMap<u32, Vec<u64>>>;
     fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<Self::CollisionResult>;
     fn bloom_insert(&self, inner_hashed: &HashMap<u32, Vec<u64>>);
     fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>>;
     fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>>;
-    fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()>;
+    fn insert_disk_io_cache(&self, key: &str, shards_idx: &Vec<u32>) -> Result<()>;
+    fn rehash_list_update(&self, shard_idx: &Vec<u32>) -> Result<()>;
 }
 
 impl BloomFilter for OuterBlooms {
-    type CollisionResult = OuterCollisionResult;
+    type CollisionResult = CollisionResult;
 
     fn contains_and_insert(&self, key: &str) -> Result<bool> {
-        let outer_shard_slots = self.array_partition_hash(key)?; // get the outer blooms three shard idx
+        let outer_shard_slots = self.array_partition_hash(key)?; // get the outer blooms two shard idx
         let outer_blooms_idx = self.bloom_hash(&outer_shard_slots, key)?;
         let outer_collision_result = self.bloom_check(&outer_blooms_idx)?;
 
         let outer_exists = match outer_collision_result {
-            OuterCollisionResult::Zero => {
+            CollisionResult::Zero => {
                 self.bloom_insert(&outer_blooms_idx);
+                self.insert_disk_io_cache(key, &outer_shard_slots)?;
                 false
             }
-            OuterCollisionResult::Partial(_) => {
+            CollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&outer_blooms_idx);
+                self.insert_disk_io_cache(key, &outer_shard_slots)?;
                 false
             }
-            OuterCollisionResult::Complete(s1, s2) => {
+            CollisionResult::PartialMajor(s1, s2) => {
                 tracing::info!(
-                    "OUTER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} Value: {}",
+                    "INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}",
                     s1,
                     s2,
                     key
                 );
+                self.bloom_insert(&outer_blooms_idx);
+                self.insert_disk_io_cache(key, &outer_shard_slots)?;
+                self.rehash_list_update(&outer_shard_slots)?;
+                false
+            }
+            CollisionResult::Complete(s1, s2, s3) => {
+                tracing::info!(
+                    "INNER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}",
+                    s1,
+                    s2,
+                    s3,
+                    key
+                );
                 true
             }
-            OuterCollisionResult::Error => {
+            CollisionResult::Error => {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
 
-        self.insert_disk_io_cache(key, outer_shard_slots)?;
+        
 
         Ok(outer_exists)
     }
 
     fn bloom_hash(
         &self,
-        vector_partitions: &Vec<u32>,
+        vector_partitions: &[u32],
         key: &str,
     ) -> Result<HashMap<u32, Vec<u64>>> {
         let mut inner_hash_list = HashMap::new();
@@ -228,7 +292,7 @@ impl BloomFilter for OuterBlooms {
         Ok(inner_hash_list)
     }
 
-    fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<OuterCollisionResult> {
+    fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<CollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
         let inner = self.outer_shards.read().unwrap();
 
@@ -239,7 +303,7 @@ impl BloomFilter for OuterBlooms {
             collision_map.insert(*index, key_exists);
         }
 
-        let collision_result = outer_check_collision(&collision_map)?;
+        let collision_result = check_collision(&collision_map)?;
 
         Ok(collision_result)
     }
@@ -264,8 +328,8 @@ impl BloomFilter for OuterBlooms {
     fn array_partition_hash(&self, key: &str) -> Result<Vec<u32>> {
         // two shards: jump hash p1 and use n/2 mod shard len
         // three shards: jump hash p1, use p1+n/3 mod n and p1+2n/3 mod n
-
-        let shard_len: u32 = STATIC_VECTOR_LENGTH_OUTER as u32;
+        /*
+         let shard_len: u32 = STATIC_VECTOR_LENGTH_OUTER as u32;
 
         let h1 =
             murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])?;
@@ -274,12 +338,35 @@ impl BloomFilter for OuterBlooms {
         let low = h1 as u64;
         let shard_size = shard_len / 2;
 
-        let p1 = jump_hash_partition(low ^ high, shard_len as u32)?;
-        let p2 = (p1 + shard_size) % shard_len as u32;
+        let p1 = jump_hash_partition(low ^ high, shard_len)?;
+        let p2 = (p1 + shard_size) % shard_len;
 
         debug_assert!(p1 != p2, "Partitions must be unique");
 
         Ok(vec![p1, p2])
+         */
+
+        let shard_len: u32 = STATIC_VECTOR_LENGTH_OUTER as u32;
+
+        let h1 =
+            murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), HASH_SEED_SELECTION[2])?;
+
+        let high = (h1 >> 64) as u64;
+        let low = h1 as u64;
+        let shard_size = shard_len / 3;
+
+        let p1 = jump_hash_partition(high ^ low, shard_len)?;
+        let p2 = (p1 + shard_size) % shard_len;
+        let p3 = (p1 + (2 * shard_size)) % shard_len;
+
+        debug_assert!(
+            p1 != p2 && p1 != p3 && p2 != p3,
+            "Partitions must be unique"
+        );
+
+        Ok(vec![p1, p2, p3])
+
+       
     }
 
     fn drain_cache(&mut self) -> Result<HashMap<u32, Vec<String>>> {
@@ -288,19 +375,29 @@ impl BloomFilter for OuterBlooms {
         Ok(data)
     }
 
-    fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+    fn insert_disk_io_cache(&self, key: &str, shards_idx: &Vec<u32>) -> Result<()> {
         let mut inner = self.outer_disk_cache.lock().unwrap();
 
         for idx in shards_idx {
-            inner.entry(idx).or_default().push(key.to_string());
+            inner.entry(*idx).or_default().push(key.to_string());
         }
+
+        Ok(())
+    }
+
+    fn rehash_list_update(&self, shards_idx: &Vec<u32>) -> Result<()> {
+        let mut rehash_list = self.outer_rehash_list.lock().unwrap();
+        for shard_idx in shards_idx {
+            rehash_list.insert(*shard_idx);
+        }
+        
 
         Ok(())
     }
 }
 
 impl BloomFilter for InnerBlooms {
-    type CollisionResult = InnerCollisionResult;
+    type CollisionResult = CollisionResult;
 
     fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let inner_shard_slots = self.array_partition_hash(key)?; // get the outer blooms three shard idx
@@ -308,15 +405,17 @@ impl BloomFilter for InnerBlooms {
         let inner_collision_result = self.bloom_check(&inner_blooms_idx)?;
 
         let inner_exists = match inner_collision_result {
-            InnerCollisionResult::Zero => {
+            CollisionResult::Zero => {
                 self.bloom_insert(&inner_blooms_idx);
+                self.insert_disk_io_cache(key, &inner_shard_slots)?;
                 false
             }
-            InnerCollisionResult::PartialMinor(_) => {
+            CollisionResult::PartialMinor(_) => {
                 self.bloom_insert(&inner_blooms_idx);
+                self.insert_disk_io_cache(key, &inner_shard_slots)?;
                 false
             }
-            InnerCollisionResult::PartialMajor(s1, s2) => {
+            CollisionResult::PartialMajor(s1, s2) => {
                 tracing::info!(
                     "INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}",
                     s1,
@@ -324,9 +423,11 @@ impl BloomFilter for InnerBlooms {
                     key
                 );
                 self.bloom_insert(&inner_blooms_idx);
+                self.insert_disk_io_cache(key, &inner_shard_slots)?;
+                self.rehash_list_update(&inner_shard_slots)?;
                 false
             }
-            InnerCollisionResult::Complete(s1, s2, s3) => {
+            CollisionResult::Complete(s1, s2, s3) => {
                 tracing::info!(
                     "INNER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}",
                     s1,
@@ -336,19 +437,19 @@ impl BloomFilter for InnerBlooms {
                 );
                 true
             }
-            InnerCollisionResult::Error => {
+            CollisionResult::Error => {
                 panic!("unexpected issue with collision result for key: {key}");
             }
         };
 
-        self.insert_disk_io_cache(key, inner_shard_slots)?;
+        
 
         Ok(inner_exists)
     }
 
     fn bloom_hash(
         &self,
-        vector_partitions: &Vec<u32>,
+        vector_partitions: &[u32],
         key: &str,
     ) -> Result<HashMap<u32, Vec<u64>>> {
         let mut inner_hash_list = HashMap::new();
@@ -379,7 +480,7 @@ impl BloomFilter for InnerBlooms {
         Ok(inner_hash_list)
     }
 
-    fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<InnerCollisionResult> {
+    fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<CollisionResult> {
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
         let inner = self.inner_shards.read().unwrap();
 
@@ -390,7 +491,7 @@ impl BloomFilter for InnerBlooms {
             collision_map.insert(*index, key_exists);
         }
 
-        let collision_result = inner_check_collision(&collision_map)?;
+        let collision_result = check_collision(&collision_map)?;
 
         Ok(collision_result)
     }
@@ -425,9 +526,9 @@ impl BloomFilter for InnerBlooms {
         let low = h1 as u64;
         let shard_size = shard_len / 3;
 
-        let p1 = jump_hash_partition(high ^ low, shard_len as u32)?;
-        let p2 = (p1 + shard_size) % shard_len as u32;
-        let p3 = (p1 + (2 * shard_size)) % shard_len as u32;
+        let p1 = jump_hash_partition(high ^ low, shard_len)?;
+        let p2 = (p1 + shard_size) % shard_len;
+        let p3 = (p1 + (2 * shard_size)) % shard_len;
 
         debug_assert!(
             p1 != p2 && p1 != p3 && p2 != p3,
@@ -443,11 +544,20 @@ impl BloomFilter for InnerBlooms {
         Ok(data)
     }
 
-    fn insert_disk_io_cache(&self, key: &str, shards_idx: Vec<u32>) -> Result<()> {
+    fn insert_disk_io_cache(&self, key: &str, shards_idx: &Vec<u32>) -> Result<()> {
         let mut inner = self.inner_disk_cache.lock().unwrap();
 
         for idx in shards_idx {
-            inner.entry(idx).or_default().push(key.to_string());
+            inner.entry(*idx).or_default().push(key.to_string());
+        }
+
+        Ok(())
+    }
+
+    fn rehash_list_update(&self, shards_idx: &Vec<u32>) -> Result<()> {
+        let mut rehash_list = self.inner_rehash_list.lock().unwrap();
+        for shard_idx in shards_idx {
+            rehash_list.insert(*shard_idx);
         }
 
         Ok(())
@@ -559,14 +669,19 @@ fn jump_hash_partition(key: u64, buckets: u32) -> Result<u32> {
     Ok(b as u32)
 }
 
-pub enum OuterCollisionResult {
+
+ /*
+ pub enum OuterCollisionResult {
     Zero,
     Partial(u32),
     Complete(u32, u32),
     Error,
 }
+  */
 
-pub enum InnerCollisionResult {
+
+
+pub enum CollisionResult {
     Zero,
     PartialMinor(u32),
     PartialMajor(u32, u32),
@@ -574,7 +689,7 @@ pub enum InnerCollisionResult {
     Error,
 }
 
-pub fn outer_check_collision(map: &HashMap<u32, bool>) -> Result<OuterCollisionResult> {
+pub fn check_collision(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
     let mut collided = vec![];
 
     map.iter().for_each(|(vector_indx, boolean)| {
@@ -584,30 +699,11 @@ pub fn outer_check_collision(map: &HashMap<u32, bool>) -> Result<OuterCollisionR
     });
 
     let collision_result = match collided.as_slice() {
-        [] => OuterCollisionResult::Zero,
-        [one] => OuterCollisionResult::Partial(**one),
-        [one, two] => OuterCollisionResult::Complete(**one, **two),
-        _ => OuterCollisionResult::Error,
-    };
-
-    Ok(collision_result)
-}
-
-pub fn inner_check_collision(map: &HashMap<u32, bool>) -> Result<InnerCollisionResult> {
-    let mut collided = vec![];
-
-    map.iter().for_each(|(vector_indx, boolean)| {
-        if *boolean {
-            collided.push(vector_indx)
-        }
-    });
-
-    let collision_result = match collided.as_slice() {
-        [] => InnerCollisionResult::Zero,
-        [one] => InnerCollisionResult::PartialMinor(**one),
-        [one, two] => InnerCollisionResult::PartialMajor(**one, **two),
-        [one, two, three] => InnerCollisionResult::Complete(**one, **two, **three),
-        _ => InnerCollisionResult::Error,
+        [] => CollisionResult::Zero,
+        [one] => CollisionResult::PartialMinor(**one),
+        [one, two] => CollisionResult::PartialMajor(**one, **two),
+        [one, two, three] => CollisionResult::Complete(**one, **two, **three),
+        _ => CollisionResult::Error,
     };
 
     Ok(collision_result)
@@ -642,40 +738,94 @@ fn write_disk_io_cache(data: HashMap<u32, Vec<String>>, cache_type: FilterType) 
     Ok(())
 }
 
+fn concurrecy_init() -> Result<(usize, usize)> {
+    let drain_threads;
+    let rehash_threads;
+
+    // Use this function instead of the num_spu crate becasue this can account for virtual machines
+    let system_threads = match std::thread::available_parallelism() {
+        Ok(c) => c.get(),
+        Err(e) => {
+            tracing::warn!("Failed to get the core count:{e}");
+            return Err(anyhow!("Failed to get the systems thread count"));
+        }
+    };
+
+    // Base cases
+    // If system threads = 2 then 1 drain, 1 rehash,
+    if system_threads == 2 { drain_threads = 1; rehash_threads = 1; return Ok((drain_threads, rehash_threads))};
+    // if system threads = 4 then 1 drain, 3 rehash
+    if system_threads == 4 { drain_threads = 1; rehash_threads = 3; return Ok((drain_threads, rehash_threads))};
+
+    let numerator = system_threads * 8;
+    let denominator = 10;
+    let rehash_threads = (numerator + denominator - 1) / denominator; // give roughly round(80%) cores to rehash
+
+    drain_threads = system_threads - rehash_threads;
+    tracing::info!("System threads: {:?}, rehash threads: {}, drain threads: {}", system_threads, rehash_threads, drain_threads);
+
+    Ok((drain_threads, rehash_threads))
+}
+
+fn rehash() -> Result<()> {
+
+
+
+
+    Ok(())
+}
+
+
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::time::Duration;
 
     use once_cell::sync::Lazy;
 
-    use crate::PerfectBloomFilter;
+    use crate::{concurrecy_init, PerfectBloomFilter};
+    static COUNT: i32 = 1_500_000;
 
-    /* static TRACING: Lazy<()> = Lazy::new(|| {
+    static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
-    });*/
+    });
 
-    #[test]
+    /* #[test]
+    fn test_rehash() -> anyhow::Result<()> {
+        Lazy::force(&TRACING);
+
+        let _ = concurrecy_init();
+
+        let _ = std::thread::sleep(Duration::from_secs(5));
+
+        Ok(())
+    }*/
+
+    
+
+
+
+     #[test]
     fn test_filter_loop_sync() -> anyhow::Result<()> {
         //Lazy::force(&TRACING);
-        let count = 2_000_000;
         let mut pf = PerfectBloomFilter::new()?;
 
         tracing::info!("Starting Insert phase 1");
-        for i in 0..count {
+        for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
 
             assert_eq!(was_present, false);
         }
         tracing::info!("Completed Insert phase 1");
-        //let mut locked_pf = pf.lock().await;
 
         tracing::info!("Starting confirmation phase 1");
-        for i in 0..count {
+        for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
 
@@ -683,27 +833,32 @@ mod tests {
         }
         tracing::info!("Completed confirmation phase 1");
 
+        let _ = std::thread::sleep(Duration::from_secs(5));
+
         Ok(())
     }
+     
+   
 
-    #[tokio::test]
+
+
+
+   #[tokio::test]
     async fn test_filter_loop_async() -> anyhow::Result<()> {
         //Lazy::force(&TRACING);
-        let count = 2_000_000;
         let mut pf = PerfectBloomFilter::new()?;
 
         tracing::info!("Starting Insert phase 1");
-        for i in 0..count {
+        for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
 
             assert_eq!(was_present, false);
         }
         tracing::info!("Completed Insert phase 1");
-        //let mut locked_pf = pf.lock().await;
 
         tracing::info!("Starting confirmation phase 1");
-        for i in 0..count {
+        for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
 
@@ -711,6 +866,11 @@ mod tests {
         }
         tracing::info!("Completed confirmation phase 1");
 
+        let _  = tokio::time::sleep(Duration::from_secs(5));
+
         Ok(())
+       
     }
+
+    
 }
