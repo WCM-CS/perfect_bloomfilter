@@ -286,9 +286,9 @@ pub trait BloomFilter {
     fn insert_disk_io_cache(&self, key: &str, shards_idx: &Vec<u32>) -> Result<()>;
     fn rehash_list_update(&self, shard_idx: &Vec<u32>) -> Result<()>;
     fn rehash(&self, shards: HashSet<u32>) -> Result<()>;
-    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()>;
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64, shards: &u32, update_metadata: bool) -> Result<()>;
     fn future_bloom_hash(&self, key: String, new_bloom_length: &u64) -> Result<Vec<u64>>;
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()>;
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>, shard: &u32, update_metadata: bool) -> Result<()>;
     fn rehash_cache_insert(&self, shards_list: Vec<u32>, key: &str) -> Result<()>;
 }   
 
@@ -483,9 +483,9 @@ impl BloomFilter for OuterBlooms {
                     outer.data[*vector_index as usize].set(bloom_index as usize, true);
                 });
                 outer_met.blooms_key_count
-                .entry(*vector_index)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
+                    .entry(*vector_index)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
             }   
         }
     }
@@ -599,24 +599,26 @@ impl BloomFilter for OuterBlooms {
                 if key_batch.len() == buffer_limit {
                     //proces_key_batch(&key_batch, shard, filter_type);
                     let batch = std::mem::take(&mut key_batch);
-                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length, shard, false).expect("Failed new filter for shard: {shard}");
                 }
             }
 
             if !key_batch.is_empty() {
                 let batch = std::mem::take(&mut key_batch);
-                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length, shard, false).expect("Failed new filter for shard: {shard}");
             }
 
             
 
             // Now acquire shard and metadata locks
             {
-      
+                // aquire the lock on the caches values, return the caches values for the shards cache
                 let shards_cached_keys = {
                     let mut resize_cache = self.outer_rehash_cache.lock().unwrap();
                     resize_cache.remove(shard)
                 };
+
+                // take the values from the cach and hsh them into teh new filter adn swap it with the old one
                 
 
                 let mut outer_shard_locked = self.outer_shards.write().unwrap();
@@ -699,13 +701,13 @@ impl BloomFilter for OuterBlooms {
         Ok(())
     }
 
-    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()> {
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64, shard: &u32, update_metadata: bool) -> Result<()> {
         key_batch.into_iter().for_each(|key| {
             // we already have the array parrtition aka shard
 
             // get the future blom hashes
             let hashes = self.future_bloom_hash(key, new_bloomfilter_length).expect("Failed to hash outer future blooms");
-            let _ = self.future_bloom_insert(hashes, filter.clone()); // mutates filter
+            let _ = self.future_bloom_insert(hashes, filter.clone(), shard, update_metadata); // mutates filter
 
         });
 
@@ -723,7 +725,8 @@ impl BloomFilter for OuterBlooms {
             let idx_u128 = idx as u128;
             let index = (h1.wrapping_add(idx_u128.wrapping_mul(h2))) % *new_bloom_length as u128;
 
-            key_hashes.push(index as u64)
+            key_hashes.push(index as u64);
+
         }
 
 
@@ -731,10 +734,19 @@ impl BloomFilter for OuterBlooms {
         Ok(key_hashes)
     }
 
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()> {
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>, shard: &u32, update_metadata: bool) -> Result<()> {
         hashes.into_iter().for_each(|bloom_hash| {
             filter.lock().unwrap().set(bloom_hash as usize, true);
         });
+
+        if update_metadata {
+            let mut locked_metadata = self.outer_metadata.write().unwrap();
+
+            locked_metadata.blooms_key_count
+                .entry(*shard)
+                .and_modify(|count| *count+=1)
+                .or_insert(1);
+        }
 
         Ok(())
     }
@@ -1030,13 +1042,13 @@ impl BloomFilter for InnerBlooms {
                 if key_batch.len() == buffer_limit {
                     //proces_key_batch(&key_batch, shard, filter_type);
                     let batch = std::mem::take(&mut key_batch);
-                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length, shard, false).expect("Failed new filter for shard: {shard}");
                 }
             }
 
             if !key_batch.is_empty() {
                 let batch = std::mem::take(&mut key_batch);
-                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length, shard, false).expect("Failed new filter for shard: {shard}");
             }
 
             {
@@ -1128,13 +1140,13 @@ impl BloomFilter for InnerBlooms {
         Ok(())
     }
 
-    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()> {
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64, shard: &u32, update_metadata: bool) -> Result<()> {
         key_batch.into_iter().for_each(|key| {
             // we already have the array parrtition aka shard
 
             // get the future blom hashes
             let hashes = self.future_bloom_hash(key, new_bloomfilter_length).expect("Failed to hash inner future blooms");
-            let _ = self.future_bloom_insert(hashes, filter.clone()); // mutates filter
+            let _ = self.future_bloom_insert(hashes, filter.clone(), shard, update_metadata); // mutates filter
 
         });
 
@@ -1152,7 +1164,9 @@ impl BloomFilter for InnerBlooms {
             let idx_u128 = idx as u128;
             let index = (h1.wrapping_add(idx_u128.wrapping_mul(h2))) % *new_bloom_length as u128;
 
-            key_hashes.push(index as u64)
+            key_hashes.push(index as u64);
+
+            
         }
 
 
@@ -1160,10 +1174,21 @@ impl BloomFilter for InnerBlooms {
         Ok(key_hashes)
     }
 
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()> {
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>, shard: &u32, update_metadata: bool) -> Result<()> {
         hashes.into_iter().for_each(|bloom_hash| {
             filter.lock().unwrap().set(bloom_hash as usize, true);
         });
+
+        if update_metadata {
+            let mut locked_metadata = self.inner_metadata.write().unwrap();
+
+            locked_metadata.blooms_key_count
+                .entry(*shard)
+                .and_modify(|count| *count+=1)
+                .or_insert(1);
+        }   
+
+      
 
         Ok(())
     }
