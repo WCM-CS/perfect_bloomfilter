@@ -2,14 +2,10 @@ use anyhow::{Result, anyhow};
 use bitvec::{bitvec, vec::BitVec};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::{self, BufRead, Cursor, Write},
-    sync::{Arc, Mutex, RwLock},
-    thread::{self},
-    time::Duration,
+    collections::{HashMap, HashSet}, fs, io::{self, BufRead, Cursor, Write}, path::Path, sync::{Arc, Mutex, RwLock}, thread::{self}, time::Duration
 };
 use threadpool::ThreadPool;
+use csv::Writer;
 
 pub const HASH_SEED_SELECTION: [u32; 6] = [9, 223, 372, 530, 775, 954];
 
@@ -103,7 +99,10 @@ impl PerfectBloomFilter {
 
                 if !shards.is_empty() {
                     let locked_filter = weak_resize_outer_filter.upgrade().unwrap();
-                    let _ = locked_filter.rehash(shards);
+                    match locked_filter.rehash(shards.clone()) {
+                        Ok(_) => tracing::info!("Rehashed inner shard: {:?}", shards),
+                        Err(_) => todo!(),
+                    }
                 }
             }
         });
@@ -121,7 +120,10 @@ impl PerfectBloomFilter {
 
                 if !shards.is_empty() {
                     let locked_filter = weak_resize_inner_filter.upgrade().unwrap();
-                    let _ = locked_filter.rehash(shards);
+                    match locked_filter.rehash(shards.clone()) {
+                        Ok(_) => tracing::info!("Rehashed inner shard: {:?}", shards),
+                        Err(_) => todo!(),
+                    }
                 }
 
             }
@@ -149,6 +151,55 @@ impl PerfectBloomFilter {
 
         Ok(outer_res && inner_res)
     }
+
+    pub fn metadata_dump(&self) -> Result<()>{
+        let outer_meta = self.outer_filter.outer_metadata.read().unwrap();
+        let inner_meta = self.inner_filter.inner_metadata.read().unwrap();
+        let path = Path::new("./metadata");
+        if !path.exists() {
+            fs::create_dir_all(path)?;
+        }
+
+        let file_path = path.join("metadata.csv");
+        let mut wtr = Writer::from_path(file_path)?;
+
+        // Write CSV headers
+        wtr.write_record(&[
+            "Type", "Shard", "KeyCount", "BitLength", "BitLengthMult"
+        ])?;
+
+        // Write Outer metadata rows
+        for (&shard, &key_count) in &outer_meta.blooms_key_count {
+            let bit_len = outer_meta.bloom_bit_length.get(&shard).copied().unwrap_or(0);
+            let mult = outer_meta.bloom_bit_length_mult.get(&shard).copied().unwrap_or(0);
+            
+            wtr.write_record(&[
+                "Outer",
+                &shard.to_string(),
+                &key_count.to_string(),
+                &bit_len.to_string(),
+                &mult.to_string(),
+            ])?;
+        }
+
+        // Write Inner metadata rows
+        for (&shard, &key_count) in &inner_meta.blooms_key_count {
+            let bit_len = inner_meta.bloom_bit_length.get(&shard).copied().unwrap_or(0);
+            let mult = inner_meta.bloom_bit_length_mult.get(&shard).copied().unwrap_or(0);
+            
+            wtr.write_record(&[
+                "Inner",
+                &shard.to_string(),
+                &key_count.to_string(),
+                &bit_len.to_string(),
+                &mult.to_string(),
+            ])?;
+        }
+
+        wtr.flush()?;
+        Ok(())
+    }
+    
 }
 
 pub struct OuterBlooms {
@@ -235,9 +286,9 @@ pub trait BloomFilter {
     fn insert_disk_io_cache(&self, key: &str, shards_idx: &Vec<u32>) -> Result<()>;
     fn rehash_list_update(&self, shard_idx: &Vec<u32>) -> Result<()>;
     fn rehash(&self, shards: HashSet<u32>) -> Result<()>;
-    fn process_key_batch(&self, key_batch: Vec<String>, filter: &mut BitVec, new_bloomfilter_length: &u64) -> Result<()>;
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()>;
     fn future_bloom_hash(&self, key: String, new_bloom_length: &u64) -> Result<Vec<u64>>;
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: &mut BitVec) -> Result<()>;
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()>;
     fn rehash_cache_insert(&self, shards_list: Vec<u32>, key: &str) -> Result<()>;
 }   
 
@@ -310,13 +361,6 @@ impl BloomFilter for OuterBlooms {
                 }
             }
             CollisionResult::PartialMajor(s1, s2) => {
-
-                tracing::info!(
-                    " BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}",
-                    s1,
-                    s2,
-                    key
-                );
                 if let Some(active_rehash_shards) = active_rehashing_shards.clone() {
                     let other_shards: Vec<u32> = outer_shard_slots
                         .iter()
@@ -347,13 +391,6 @@ impl BloomFilter for OuterBlooms {
                 }
             }
             CollisionResult::Complete(s1, s2, s3) => {
-                tracing::info!(
-                    "OUTER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}",
-                    s1,
-                    s2,
-                    s3,
-                    key
-                );
                 true
             }
             CollisionResult::Error => {
@@ -543,7 +580,8 @@ impl BloomFilter for OuterBlooms {
             };
             
             let new_bloomfilter_length = 2_u64.pow(new_shard_mult);
-            let mut new_bloomfilter: BitVec = bitvec![0; new_bloomfilter_length as usize];
+            let new_bloomfilter = Arc::new(Mutex::new(bitvec![0; new_bloomfilter_length as usize]));
+
 
 
 
@@ -561,15 +599,59 @@ impl BloomFilter for OuterBlooms {
                 if key_batch.len() == buffer_limit {
                     //proces_key_batch(&key_batch, shard, filter_type);
                     let batch = std::mem::take(&mut key_batch);
-                    self.process_key_batch(batch, &mut new_bloomfilter, &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
                 }
             }
 
             if !key_batch.is_empty() {
                 let batch = std::mem::take(&mut key_batch);
-                self.process_key_batch(batch, &mut new_bloomfilter, &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
             }
 
+            
+
+            // Now acquire shard and metadata locks
+            {
+      
+                let shards_cached_keys = {
+                    let mut resize_cache = self.outer_rehash_cache.lock().unwrap();
+                    resize_cache.remove(shard)
+                };
+                
+
+                let mut outer_shard_locked = self.outer_shards.write().unwrap();
+                let mut outer_metadata_locked = self.outer_metadata.write().unwrap();
+                let mut active_rehashing_locked = self.outer_shards_active_rehashing.write().unwrap();
+                
+                // swap bloom filter and update metadata
+                outer_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
+                drop(outer_shard_locked);
+
+                outer_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
+                outer_metadata_locked.bloom_bit_length_mult.insert(*shard, new_shard_mult);
+                drop(outer_metadata_locked);
+
+                active_rehashing_locked.remove(shard);
+                drop(active_rehashing_locked);
+
+                if let Some(keys) = shards_cached_keys {
+                    keys.iter().for_each(|key| {
+                        let partitions = vec![shard.clone()];
+                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
+
+                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
+                        let _ = self.insert_disk_io_cache(key, &partitions);
+                    })
+                }
+            }
+
+            // Now safely insert cached keys into the filter outside shard and metadata lock or while holding only the bloom filter lock
+            // fully drain into new filter before metadata updates and pass a flag into the future inert function that actually can update metadata count 
+
+
+
+
+            /*
             {
                 // lock everything you need
                 let mut outer_shard_locked = self.outer_shards.write().unwrap();
@@ -577,7 +659,7 @@ impl BloomFilter for OuterBlooms {
                 let mut active_rehashiong_locked = self.outer_shards_active_rehashing.write().unwrap();
 
                 // swap old filter withnew old
-                outer_shard_locked.data[*shard as usize] = new_bloomfilter;
+                outer_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
 
                 // update meta data
                 outer_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
@@ -587,38 +669,43 @@ impl BloomFilter for OuterBlooms {
 
                 // Remove from the active rehasing list
                 active_rehashiong_locked.remove(shard);
+
+                let shards_cached_keys = {
+                    // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
+                    let mut resize_cache = self.outer_rehash_cache.lock().unwrap();
+                    resize_cache.remove(shard)
+                };
+
+                if let Some(keys) = shards_cached_keys {
+                    keys.iter().for_each(|key| {
+                        let partitions = vec![shard.clone()];
+                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
+
+                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
+                        let _ = self.insert_disk_io_cache(key, &partitions);
+                    })
+                }
             }
+            
+             */
 
-            let shards_cached_keys = {
-                // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
-                let mut resize_cache = self.outer_rehash_cache.lock().unwrap();
-                let shards_keys = resize_cache.remove(shard);
-                shards_keys
-            };
+            
 
-            if let Some(keys) = shards_cached_keys {
-                keys.iter().for_each(|key| {
-                    let partitions = vec![shard.clone()];
-                    let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
-
-                    self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
-                    let _ = self.insert_disk_io_cache(key, &partitions);
-                })
-            }
+           
 
         });
 
-        tracing::info!("Starting rehashing for Outer: {:?}", &shards);
+        //tracing::info!("finished rehashing for Outer: {:?}", &shards);
         Ok(())
     }
 
-    fn process_key_batch(&self, key_batch: Vec<String>, mut filter: &mut BitVec, new_bloomfilter_length: &u64) -> Result<()> {
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()> {
         key_batch.into_iter().for_each(|key| {
             // we already have the array parrtition aka shard
 
             // get the future blom hashes
             let hashes = self.future_bloom_hash(key, new_bloomfilter_length).expect("Failed to hash outer future blooms");
-            let _ = self.future_bloom_insert(hashes, &mut filter); // mutates filter
+            let _ = self.future_bloom_insert(hashes, filter.clone()); // mutates filter
 
         });
 
@@ -644,9 +731,9 @@ impl BloomFilter for OuterBlooms {
         Ok(key_hashes)
     }
 
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: &mut BitVec) -> Result<()> {
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()> {
         hashes.into_iter().for_each(|bloom_hash| {
-            filter.set(bloom_hash as usize, true);
+            filter.lock().unwrap().set(bloom_hash as usize, true);
         });
 
         Ok(())
@@ -730,12 +817,6 @@ impl BloomFilter for InnerBlooms {
                 }
             }
             CollisionResult::PartialMajor(s1, s2) => {
-                tracing::info!(
-                    "INNER BLOOM: Major collision for the bloom filter at shards: {:?} & {:?}, Value: {}",
-                    s1,
-                    s2,
-                    key
-                );
                 if let Some(active_rehash_shards) = active_rehashing_shards.clone() {
                     let other_shards: Vec<u32> = inner_shard_slots
                         .iter()
@@ -762,13 +843,6 @@ impl BloomFilter for InnerBlooms {
                 }
             }
             CollisionResult::Complete(s1, s2, s3) => {
-                tracing::info!(
-                    "INNER BLOOM: Complete collision for the bloom filter at shards: {:?} & {:?} & {:?}, Value: {}",
-                    s1,
-                    s2,
-                    s3,
-                    key
-                );
                 true
             }
             CollisionResult::Error => {
@@ -938,7 +1012,7 @@ impl BloomFilter for InnerBlooms {
             };
             
             let new_bloomfilter_length = 2_u64.pow(new_shard_mult);
-            let mut new_bloomfilter: BitVec = bitvec![0; new_bloomfilter_length as usize];
+            let new_bloomfilter = Arc::new(Mutex::new(bitvec![0; new_bloomfilter_length as usize]));
 
 
 
@@ -956,23 +1030,62 @@ impl BloomFilter for InnerBlooms {
                 if key_batch.len() == buffer_limit {
                     //proces_key_batch(&key_batch, shard, filter_type);
                     let batch = std::mem::take(&mut key_batch);
-                    self.process_key_batch(batch, &mut new_bloomfilter, &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                    self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
                 }
             }
 
             if !key_batch.is_empty() {
                 let batch = std::mem::take(&mut key_batch);
-                self.process_key_batch(batch, &mut new_bloomfilter, &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
+                self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length).expect("Failed new filter for shard: {shard}");
             }
 
             {
+      
+                let shards_cached_keys = {
+                    let mut resize_cache = self.inner_rehash_cache.lock().unwrap();
+                    resize_cache.remove(shard)
+                };
+                
+
+                let mut outer_shard_locked = self.inner_shards.write().unwrap();
+                let mut outer_metadata_locked = self.inner_metadata.write().unwrap();
+                let mut active_rehashing_locked = self.inner_shards_active_rehashing.write().unwrap();
+                
+                // swap bloom filter and update metadata
+                outer_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
+                drop(outer_shard_locked);
+
+                outer_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
+                outer_metadata_locked.bloom_bit_length_mult.insert(*shard, new_shard_mult);
+                drop(outer_metadata_locked);
+
+                active_rehashing_locked.remove(shard);
+                drop(active_rehashing_locked);
+
+                if let Some(keys) = shards_cached_keys {
+                    keys.iter().for_each(|key| {
+                        let partitions = vec![shard.clone()];
+                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
+
+                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
+                        let _ = self.insert_disk_io_cache(key, &partitions);
+                    })
+                }
+            }
+
+           
+
+            // INSERT ALL CACHED DATA BEFORE SWAPPING THE NEW FILTER WITH THE OLD AND RELESING THE LOCK BUT DO IT FAST
+
+
+            /* {
                 // lock everything you need
                 let mut inner_shard_locked = self.inner_shards.write().unwrap();
                 let mut inner_metadata_locked = self.inner_metadata.write().unwrap();
                 let mut active_rehashiong_locked = self.inner_shards_active_rehashing.write().unwrap();
 
                 // swap old filter withnew old
-                inner_shard_locked.data[*shard as usize] = new_bloomfilter;
+                inner_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
 
                 // update meta data
                 inner_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
@@ -982,38 +1095,46 @@ impl BloomFilter for InnerBlooms {
 
                 // Remove from the active rehasing list
                 active_rehashiong_locked.remove(shard);
+
+                let shards_cached_keys = {
+                    // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
+                    let mut resize_cache = self.inner_rehash_cache.lock().unwrap();
+                    let shards_keys = resize_cache.remove(shard);
+                    shards_keys
+                };
+
+                if let Some(keys) = shards_cached_keys {
+                    keys.iter().for_each(|key| {
+                        let partitions = vec![shard.clone()];
+                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
+
+                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
+                        let _ = self.insert_disk_io_cache(key, &partitions);
+                    })
+                }
             }
 
-            let shards_cached_keys = {
-                // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
-                let mut resize_cache = self.inner_rehash_cache.lock().unwrap();
-                let shards_keys = resize_cache.remove(shard);
-                shards_keys
-            };
+             */
 
-            if let Some(keys) = shards_cached_keys {
-                keys.iter().for_each(|key| {
-                    let partitions = vec![shard.clone()];
-                    let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
+           
 
-                    self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
-                    let _ = self.insert_disk_io_cache(key, &partitions);
-                })
-            }
+            
 
         });
+
+        //tracing::info!("finished rehashing for inner: {:?}", &shards);
 
 
         Ok(())
     }
 
-    fn process_key_batch(&self, key_batch: Vec<String>, mut filter: &mut BitVec, new_bloomfilter_length: &u64) -> Result<()> {
+    fn process_key_batch(&self, key_batch: Vec<String>, filter: Arc<Mutex<BitVec>>, new_bloomfilter_length: &u64) -> Result<()> {
         key_batch.into_iter().for_each(|key| {
             // we already have the array parrtition aka shard
 
             // get the future blom hashes
             let hashes = self.future_bloom_hash(key, new_bloomfilter_length).expect("Failed to hash inner future blooms");
-            let _ = self.future_bloom_insert(hashes, &mut filter); // mutates filter
+            let _ = self.future_bloom_insert(hashes, filter.clone()); // mutates filter
 
         });
 
@@ -1039,9 +1160,9 @@ impl BloomFilter for InnerBlooms {
         Ok(key_hashes)
     }
 
-    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: &mut BitVec) -> Result<()> {
+    fn future_bloom_insert(&self, hashes: Vec<u64>, filter: Arc<Mutex<BitVec>>) -> Result<()> {
         hashes.into_iter().for_each(|bloom_hash| {
-            filter.set(bloom_hash as usize, true);
+            filter.lock().unwrap().set(bloom_hash as usize, true);
         });
 
         Ok(())
@@ -1281,7 +1402,7 @@ mod tests {
     use once_cell::sync::Lazy;
 
     use crate::{concurrecy_init, PerfectBloomFilter};
-    static COUNT: i32 = 2_000_000;
+    static COUNT: i32 = 1_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -1306,7 +1427,17 @@ mod tests {
 
      #[test]
     fn test_filter_loop_sync() -> anyhow::Result<()> {
+       
         Lazy::force(&TRACING);
+
+        match std::fs::remove_dir_all("./pbf_data") {
+            Ok(_) => tracing::info!("Deleted pbf data"),
+            Err(e) => tracing::warn!("Failed to delete PBF data: {e}"),
+        }
+        match std::fs::remove_dir_all("./metadata") {
+            Ok(_) => tracing::info!("Deleted pbf data"),
+            Err(e) => tracing::warn!("Failed to delete PBF data: {e}"),
+        }
         let mut pf = PerfectBloomFilter::new()?;
 
         tracing::info!("Starting Insert phase 1");
@@ -1318,10 +1449,15 @@ mod tests {
             }
 
             assert_eq!(was_present, false);
+
+             
+             
         }
         tracing::info!("Completed Insert phase 1");
+        //let _ = pf.metadata_dump();
+        let _ = std::thread::sleep(Duration::from_secs(5));
 
-        /*
+        
          
         tracing::info!("Starting confirmation phase 1");
         for i in 0..COUNT {
@@ -1337,7 +1473,7 @@ mod tests {
 
         let _ = std::thread::sleep(Duration::from_secs(5));
         
-         */
+         
        
          
 

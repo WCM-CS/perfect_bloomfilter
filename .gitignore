@@ -4,3 +4,4 @@
 
 *.db
 /pbf_data
+/metadata
