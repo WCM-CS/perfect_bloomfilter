@@ -18,8 +18,11 @@ pub const STATIC_VECTOR_LENGTH_INNER: u32 = 8192;
 // PRE-rehashing implementation
 // x,y = 13, 12: 109.2 MB, 1.5M keys passed, 62.37 seconds 
 // Scale this out linearly we get roughly 25 M keys no false positive with 4 GB memory
-static OUTER_BLOOM_STARTING_MULT: u32 = 13;
-static INNER_BLOOM_STARTING_MULT: u32 = 12;
+//static OUTER_BLOOM_STARTING_MULT: u32 = 13;
+//static INNER_BLOOM_STARTING_MULT: u32 = 12;
+
+static OUTER_BLOOM_STARTING_MULT: u32 = 14;
+static INNER_BLOOM_STARTING_MULT: u32 = 14;
 
 static OUTER_BLOOM_DEFAULT_LENGTH: u64 = 2_u64.pow( OUTER_BLOOM_STARTING_MULT);
 static INNER_BLOOM_DEFAULT_LENGTH: u64 = 2_u64.pow( INNER_BLOOM_STARTING_MULT);
@@ -378,14 +381,13 @@ impl BloomFilter for OuterBlooms {
                         self.bloom_insert(&outer_blooms_idx, active_rehashing_shards, key);
                         self.insert_disk_io_cache(key, &outer_shard_slots)?;
                         let _ = self.rehash_list_update(&vec![s1, s2]);
-                        let _ = self.rehash_list_update(&vec![s1, s2]);
+                        
                         false
                     }
                     
                 } else {
                     self.bloom_insert(&outer_blooms_idx, active_rehashing_shards, key);
                     self.insert_disk_io_cache(key, &outer_shard_slots)?;
-                    let _ = self.rehash_list_update(&vec![s1, s2]);
                     let _ = self.rehash_list_update(&vec![s1, s2]);
                     false
                 }
@@ -438,6 +440,7 @@ impl BloomFilter for OuterBlooms {
     }
 
     fn bloom_check(&self, map: &HashMap<u32, Vec<u64>>) -> Result<CollisionResult> {
+        // return them is in the cache
         let mut collision_map: HashMap<u32, bool> = HashMap::new();
         let inner = self.outer_shards.read().unwrap();
 
@@ -572,25 +575,29 @@ impl BloomFilter for OuterBlooms {
                 // Put the shard into 'Rehashing Mode' 
                 let mut locked_shard = self.outer_shards_active_rehashing.write().unwrap();
                 locked_shard.insert(shard.clone());
+
+                let locked_meta = self.outer_metadata.write().unwrap();
+                
             }
 
+            // get the new shards updated length
             let new_shard_mult = {
             let locked_metadata = self.outer_metadata.read().unwrap();
                 locked_metadata.bloom_bit_length_mult.get(shard).unwrap().clone() + 1
             };
             
+            // Create new bloomfilter with the updates length
             let new_bloomfilter_length = 2_u64.pow(new_shard_mult);
             let new_bloomfilter = Arc::new(Mutex::new(bitvec![0; new_bloomfilter_length as usize]));
 
-
-
-
+            // define file to read from
             let file_name = format!("./pbf_data/{}_{}.txt", filter, shard);
             let file = fs::OpenOptions::new()
                 .read(true)
                 .open(&file_name).unwrap();
             let reader = io::BufReader::new(file);
 
+            // Read from the file in batcehs of 500 lines
             let mut key_batch: Vec<String> = Vec::with_capacity(buffer_limit);
             for line_res in reader.lines() {
                 let line = line_res.unwrap();
@@ -603,6 +610,7 @@ impl BloomFilter for OuterBlooms {
                 }
             }
 
+            // collect remainer after the final btch si taken fo 500 len
             if !key_batch.is_empty() {
                 let batch = std::mem::take(&mut key_batch);
                 self.process_key_batch(batch, new_bloomfilter.clone(), &new_bloomfilter_length, shard, false).expect("Failed new filter for shard: {shard}");
@@ -610,7 +618,8 @@ impl BloomFilter for OuterBlooms {
 
             
 
-            // Now acquire shard and metadata locks
+            // Now all of the data from the file have been inserted intot he filter, besdies from the filters cache
+            //acquire shard and metadata locks
             {
                 // aquire the lock on the caches values, return the caches values for the shards cache
                 let shards_cached_keys = {
@@ -627,14 +636,19 @@ impl BloomFilter for OuterBlooms {
                 
                 // swap bloom filter and update metadata
                 outer_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
-                drop(outer_shard_locked);
+                
 
                 outer_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
                 outer_metadata_locked.bloom_bit_length_mult.insert(*shard, new_shard_mult);
-                drop(outer_metadata_locked);
+                
 
                 active_rehashing_locked.remove(shard);
+
+                drop(outer_shard_locked);
+                drop(outer_metadata_locked);
                 drop(active_rehashing_locked);
+
+                
 
                 if let Some(keys) = shards_cached_keys {
                     keys.iter().for_each(|key| {
@@ -653,43 +667,6 @@ impl BloomFilter for OuterBlooms {
 
 
 
-            /*
-            {
-                // lock everything you need
-                let mut outer_shard_locked = self.outer_shards.write().unwrap();
-                let mut outer_metadata_locked = self.outer_metadata.write().unwrap();
-                let mut active_rehashiong_locked = self.outer_shards_active_rehashing.write().unwrap();
-
-                // swap old filter withnew old
-                outer_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
-
-                // update meta data
-                outer_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
-                outer_metadata_locked.bloom_bit_length_mult.insert(*shard, new_shard_mult);
-                //outer_metadata_locked.bloom_bit_length.entry(*shard).or_insert(new_bloomfilter_length);
-                //outer_metadata_locked.bloom_bit_length_mult.entry(*shard).or_insert(new_shard_mult);
-
-                // Remove from the active rehasing list
-                active_rehashiong_locked.remove(shard);
-
-                let shards_cached_keys = {
-                    // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
-                    let mut resize_cache = self.outer_rehash_cache.lock().unwrap();
-                    resize_cache.remove(shard)
-                };
-
-                if let Some(keys) = shards_cached_keys {
-                    keys.iter().for_each(|key| {
-                        let partitions = vec![shard.clone()];
-                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
-
-                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
-                        let _ = self.insert_disk_io_cache(key, &partitions);
-                    })
-                }
-            }
-            
-             */
 
             
 
@@ -845,6 +822,7 @@ impl BloomFilter for InnerBlooms {
                     } else {
                         self.bloom_insert(&inner_blooms_idx, active_rehashing_shards, key);
                         self.insert_disk_io_cache(key, &inner_shard_slots)?;
+                        let _ = self.rehash_list_update(&vec![s1, s2]);
                         false
                     }
                     
@@ -1085,48 +1063,6 @@ impl BloomFilter for InnerBlooms {
                 }
             }
 
-           
-
-            // INSERT ALL CACHED DATA BEFORE SWAPPING THE NEW FILTER WITH THE OLD AND RELESING THE LOCK BUT DO IT FAST
-
-
-            /* {
-                // lock everything you need
-                let mut inner_shard_locked = self.inner_shards.write().unwrap();
-                let mut inner_metadata_locked = self.inner_metadata.write().unwrap();
-                let mut active_rehashiong_locked = self.inner_shards_active_rehashing.write().unwrap();
-
-                // swap old filter withnew old
-                inner_shard_locked.data[*shard as usize] = new_bloomfilter.lock().unwrap().clone();
-
-                // update meta data
-                inner_metadata_locked.bloom_bit_length.insert(*shard, new_bloomfilter_length);
-                inner_metadata_locked.bloom_bit_length_mult.insert(*shard, new_shard_mult);
-                //outer_metadata_locked.bloom_bit_length.entry(*shard).or_insert(new_bloomfilter_length);
-                //outer_metadata_locked.bloom_bit_length_mult.entry(*shard).or_insert(new_shard_mult);
-
-                // Remove from the active rehasing list
-                active_rehashiong_locked.remove(shard);
-
-                let shards_cached_keys = {
-                    // lock the resize cache adn drain it for she shards adnrehash into the new filetr via proper functions not future
-                    let mut resize_cache = self.inner_rehash_cache.lock().unwrap();
-                    let shards_keys = resize_cache.remove(shard);
-                    shards_keys
-                };
-
-                if let Some(keys) = shards_cached_keys {
-                    keys.iter().for_each(|key| {
-                        let partitions = vec![shard.clone()];
-                        let outer_blooms_idx = self.bloom_hash(&partitions, key).expect("Failed to pull bloomfilter idx from rehash");
-
-                        self.bloom_insert(&outer_blooms_idx, None, key);// insert updated the metadata counts
-                        let _ = self.insert_disk_io_cache(key, &partitions);
-                    })
-                }
-            }
-
-             */
 
            
 
@@ -1235,6 +1171,7 @@ struct OuterMetaData {
     blooms_key_count: HashMap<u32, u64>,
     bloom_bit_length: HashMap<u32, u64>,
     bloom_bit_length_mult: HashMap<u32, u32>,
+    bloom_rehashes_count: u32,
 }
 
 impl Default for OuterMetaData {
@@ -1258,7 +1195,8 @@ impl OuterMetaData {
         Self {
             blooms_key_count: key_count,
             bloom_bit_length: bit_length,
-            bloom_bit_length_mult: bit_length_mult
+            bloom_bit_length_mult: bit_length_mult,
+            bloom_rehashes_count: 0
         }
     }
 }
@@ -1268,6 +1206,7 @@ struct InnerMetaData {
     blooms_key_count: HashMap<u32, u64>,
     bloom_bit_length: HashMap<u32, u64>,
     bloom_bit_length_mult: HashMap<u32, u32>,
+    bloom_rehashes_count: u32,
 }
 impl Default for InnerMetaData {
     fn default() -> Self {
@@ -1290,7 +1229,8 @@ impl InnerMetaData {
         Self {
             blooms_key_count: key_count,
             bloom_bit_length: bit_length,
-            bloom_bit_length_mult: bit_length_mult
+            bloom_bit_length_mult: bit_length_mult,
+            bloom_rehashes_count: 0
         }
     }
 }
@@ -1427,7 +1367,7 @@ mod tests {
     use once_cell::sync::Lazy;
 
     use crate::{concurrecy_init, PerfectBloomFilter};
-    static COUNT: i32 = 1_000_000;
+    static COUNT: i32 = 5_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -1479,12 +1419,11 @@ mod tests {
              
         }
         tracing::info!("Completed Insert phase 1");
-        //let _ = pf.metadata_dump();
+        let _ = pf.metadata_dump();
         let _ = std::thread::sleep(Duration::from_secs(5));
 
-        
-         
-        tracing::info!("Starting confirmation phase 1");
+        /*
+         tracing::info!("Starting confirmation phase 1");
         for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
@@ -1497,6 +1436,10 @@ mod tests {
         tracing::info!("Completed confirmation phase 1");
 
         let _ = std::thread::sleep(Duration::from_secs(5));
+        
+         */
+         
+       
         
          
        
