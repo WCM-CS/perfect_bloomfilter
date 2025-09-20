@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::{self, init::GLOBAL_PBF, outer_filters::OUTER_ARRAY_SHARDS, utils::jump_hash_partition}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
+use crate::{bloom::{self, init::GLOBAL_PBF, inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, utils::jump_hash_partition}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
 
 pub const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 pub const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
@@ -22,7 +22,7 @@ pub fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32
             (OUTER_ARRAY_SHARDS - 1, HASH_SEED_SELECTION[0])
         },
         FilterType::Inner => {
-            (OUTER_ARRAY_SHARDS - 1, HASH_SEED_SELECTION[1])
+            (INNER_ARRAY_SHARDS - 1, HASH_SEED_SELECTION[1])
         }
     };
 
@@ -72,7 +72,8 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
         }
     };
 
-    for shard in shards {
+    for (i, shard) in shards.iter().enumerate() {
+
 
         let mut key_hashes = Vec::with_capacity(OUTER_BLOOM_HASH_FAMILY_SIZE as usize);
         let h1 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[0])?;
@@ -80,7 +81,7 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
 
         for idx in 0..hash_family_size {
             let idx_u128 = idx as u128;
-            let mask = bitvec_lens.get(idx as usize).unwrap() - 1;
+            let mask = bitvec_lens.get(i).unwrap() - 1;
             let index = (h1.wrapping_add(idx_u128.wrapping_mul(h2))) & mask as u128;
 
             key_hashes.push(index as u64)

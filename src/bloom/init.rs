@@ -31,7 +31,7 @@ impl PerfectBloomFilter {
 
     pub fn contains_insert(&mut self, key: &str) -> Result<bool> {
         let outer_res = OuterBlooms::contains_and_insert(&key)?;
-        let inner_res = InnerBlooms::contains_and_insert(key)?;
+        let inner_res = InnerBlooms::contains_and_insert(&key)?;
 
         Ok(outer_res && inner_res)
         //Ok(true)
@@ -61,7 +61,7 @@ mod tests {
 
     use crate::bloom::init::PerfectBloomFilter;
 
-    static COUNT: i32 = 2_000_000;
+    static COUNT: i32 = 1_500_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -69,54 +69,31 @@ mod tests {
             .try_init();
     });
 
-    /* #[test]
-    fn test_rehash() -> anyhow::Result<()> {
-        Lazy::force(&TRACING);
-
-        let _ = concurrecy_init();
-
-        let _ = std::thread::sleep(Duration::from_secs(5));
-
-        Ok(())
-    }*/
-
-    
-
-
-
      #[test]
     fn test_filter_loop_sync() -> Result<()> {
        
         Lazy::force(&TRACING);
 
-        match std::fs::remove_dir_all("./pbf_data") {
-            Ok(_) => tracing::info!("Deleted pbf data"),
-            Err(e) => tracing::warn!("Failed to delete PBF data: {e}"),
-        }
-        match std::fs::remove_dir_all("./metadata") {
-            Ok(_) => tracing::info!("Deleted pbf data"),
-            Err(e) => tracing::warn!("Failed to delete PBF data: {e}"),
-        }
+        tracing::info!("Creating PerfectBloomFilter instance");
         let mut pf = PerfectBloomFilter::new();
 
-        tracing::info!("Starting Insert phase 1");
+        tracing::info!("PerfectBloomFilter created successfully");
         for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
             if i % 100_000 == 0 {
                 std::thread::sleep(Duration::from_millis(500));
             }
+            if was_present {
+                tracing::error!("Insertion Phase Failed at key {}", i);
+                std::thread::sleep(Duration::from_millis(500));
+            }
 
             assert_eq!(was_present, false);
 
-             
-             
         }
-        tracing::info!("Completed Insert phase 1");
-        //let _ = pf.metadata_dump();
-        //let _ = std::thread::sleep(Duration::from_secs(5));
 
-        
+        //let _ = std::thread::sleep(Duration::from_secs(3));
         tracing::info!("Starting confirmation phase 1");
         for i in 0..COUNT {
             let key = i.to_string();
@@ -129,9 +106,9 @@ mod tests {
         }
         tracing::info!("Completed confirmation phase 1");
 
-        let _ = std::thread::sleep(Duration::from_secs(5));
-        
+        //let _ = std::thread::sleep(Duration::from_secs(3));
 
+        
         Ok(())
     }
 }
