@@ -61,7 +61,7 @@ mod tests {
 
     use crate::bloom::init::PerfectBloomFilter;
 
-    static COUNT: i32 = 1_500_000;
+    static COUNT: i32 = 4_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
