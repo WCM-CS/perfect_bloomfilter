@@ -1,7 +1,9 @@
-use std::{sync::{RwLock}};
+use std::{collections::HashMap, sync::RwLock};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
+
+use crate::bloom::hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert};
 
 pub const INNER_ARRAY_SHARDS: u32 = 8192;
 
@@ -10,7 +12,7 @@ pub const INNER_BLOOM_STARTING_LENGTH: u64 = 2_u64.pow( INNER_BLOOM_STARTING_MUL
 
 
 pub struct InnerBlooms {
-    filters: [RwLock<BitVec>; INNER_ARRAY_SHARDS as usize],
+    pub(crate) filters: [RwLock<BitVec>; INNER_ARRAY_SHARDS as usize],
 }
 
 impl Default for InnerBlooms {
@@ -23,8 +25,29 @@ impl Default for InnerBlooms {
 }
 
 impl InnerBlooms {
-    pub fn contains_and_insert(&self, key: &str) -> Result<()> {
-        Ok(())
+    pub fn contains_and_insert(key: &str) -> Result<bool> {
+        let shards = array_sharding_hash(key, crate::FilterType::Inner)?;
+        let map = bloom_hash(&shards, key, crate::FilterType::Inner)?;
+        let result = bloom_check(&map, crate::FilterType::Inner)?;
+
+        let exists = match result {
+            crate::CollisionResult::Zero => {
+                bloom_insert(&map, crate::FilterType::Inner);
+                false
+            },
+            crate::CollisionResult::Partial(_) => {
+                bloom_insert(&map, crate::FilterType::Inner);
+                false
+            }
+            crate::CollisionResult::Complete(_, _) => {
+                true
+            }
+            crate::CollisionResult::Error => {
+                tracing::warn!("unexpected issue with collision result for key: {key}");
+                return Err(anyhow!("Failed to match collision rsult of Inner bloom"))
+            }
+        };
+        Ok(exists)
 
     }
 }

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::{inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, utils::jump_hash_partition}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
+use crate::{bloom::{self, init::GLOBAL_PBF, outer_filters::OUTER_ARRAY_SHARDS, utils::jump_hash_partition}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
 
 pub const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 pub const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
@@ -16,7 +16,7 @@ pub const HASH_SEED_SELECTION: [u32; 6] = [
 ];
 
 
-fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32>> {
+pub fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32>> {
     let (mask, hash_seed) = match filter_type {
         FilterType::Outer => {
             (OUTER_ARRAY_SHARDS - 1, HASH_SEED_SELECTION[0])
@@ -47,7 +47,7 @@ fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32>> {
 }
 
 // Kirsch-Mitzenmacher optimization 
-fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<HashMap<u32, Vec<u64>>> {
+pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<HashMap<u32, Vec<u64>>> {
     let mut hash_list = HashMap::new();
     
     // get the shards bit lengths 
@@ -87,18 +87,81 @@ fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<Hash
         }
 
         hash_list.insert(*shard, key_hashes);
-
-            
+ 
     }
 
     Ok(hash_list)
 
 }
 
-fn bloom_insert(outer_hashed: &HashMap<u32, Vec<u64>>, active_rehashing_shards: Option<Vec<u32>>, key: &str) -> Result<()> {
-    return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
+pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: FilterType) {
+        for (idx, hashes) in shards_hashes {
+            match filter_type {
+                FilterType::Outer => {
+                    let mut locked_filter = GLOBAL_PBF.outer_filter.filters[*idx as usize].write().unwrap();
+                    let mut locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count.write().unwrap();
+                    
+                    hashes.iter().for_each(|&bloom_index| {
+                        locked_filter.set(bloom_index as usize, true);
+                        locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                    });
+                },
+                FilterType::Inner => {
+                    let mut locked_filter = GLOBAL_PBF.inner_filter.filters[*idx as usize].write().unwrap();
+                    let mut locked_metadata = GLOBAL_METADATA.inner_metadata.blooms_key_count.write().unwrap();
+                    
+                    hashes.iter().for_each(|&bloom_index| {
+                    locked_filter.set(bloom_index as usize, true);
+                    locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                });
+            
+            }
+        }
+    }
 }
 
-fn bloom_collision_check(map: &HashMap<u32, Vec<u64>>, active_rehashing_shards: &Option<Vec<u32>>) -> Result<CollisionResult> {
-    return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
+pub fn bloom_check(map: &HashMap<u32, Vec<u64>>, filter_type: FilterType) -> Result<CollisionResult> {
+    let mut collision_map: HashMap<u32, bool> = HashMap::new();
+
+    match filter_type {
+        FilterType::Outer => {
+            for (&shard, hashes) in map {
+                let locked_pbf = GLOBAL_PBF.outer_filter.filters[shard as usize].read().unwrap();
+                let all_set = hashes.iter().all(|&bloom_index| locked_pbf[bloom_index as usize]);
+
+                collision_map.insert(shard, all_set);
+            }
+        }
+        FilterType::Inner => {
+            for (&shard, hashes) in map {
+                let locked_pbf = GLOBAL_PBF.inner_filter.filters[shard as usize].read().unwrap();
+                let all_set = hashes.iter().all(|&bloom_index| locked_pbf[bloom_index as usize]);
+
+                collision_map.insert(shard, all_set);
+            }
+        }
+    }
+
+    Ok(process_collisions(&collision_map)?)
+
+}
+
+
+fn process_collisions(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
+    let mut collided: Vec<u32> = vec![];
+
+    map.iter().for_each(|(idx, res)| {
+        if *res {
+            collided.push(*idx);
+        }
+    });
+
+    let collision_result = match collided.as_slice() {
+        [] => CollisionResult::Zero,
+        [one] => CollisionResult::Partial(*one),
+        [one, two] => CollisionResult::Complete(*one, *two),
+        _ => CollisionResult::Error,
+    };
+
+    Ok(collision_result)
 }

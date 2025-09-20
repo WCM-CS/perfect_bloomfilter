@@ -36,7 +36,7 @@ impl MetaData {
 }
 
 pub struct Meta {
-    blooms_key_count: Arc<RwLock<HashMap<u32, u64>>>,
+    pub(crate) blooms_key_count: Arc<RwLock<HashMap<u32, u64>>>,
     pub(crate) bloom_bit_length: Arc<RwLock<HashMap<u32, u64>>>,
     bloom_bit_length_mult: Arc<RwLock<HashMap<u32, u32>>>,
     array_shards: Arc<u32>,

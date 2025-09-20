@@ -3,8 +3,10 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
+use crate::bloom::hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert};
 
-pub const OUTERBLOOM_HASH_FAMILY_SIZE: u32 = 7;
+
+
 pub const OUTER_ARRAY_SHARDS: u32 = 4096;
 
 pub const OUTER_BLOOM_STARTING_MULT: u32 = 13;
@@ -12,7 +14,7 @@ pub const OUTER_BLOOM_STARTING_LENGTH: u64 = 2_u64.pow( OUTER_BLOOM_STARTING_MUL
 
 
 pub struct OuterBlooms {
-    filters: [RwLock<BitVec>; OUTER_ARRAY_SHARDS as usize],
+    pub(crate) filters: [RwLock<BitVec>; OUTER_ARRAY_SHARDS as usize],
 }
 
 impl Default for OuterBlooms {
@@ -24,8 +26,29 @@ impl Default for OuterBlooms {
 }
 
 impl OuterBlooms {
-    pub fn contains_and_insert(&self, key: &str) -> Result<()> {
-        Ok(())
+    pub fn contains_and_insert(key: &str) -> Result<bool> {
+        let shards = array_sharding_hash(key, crate::FilterType::Outer)?;
+        let map = bloom_hash(&shards, key, crate::FilterType::Outer)?;
+        let result = bloom_check(&map, crate::FilterType::Outer)?;
+
+        let exists = match result {
+            crate::CollisionResult::Zero => {
+                bloom_insert(&map, crate::FilterType::Outer);
+                false
+            },
+            crate::CollisionResult::Partial(_) => {
+                bloom_insert(&map, crate::FilterType::Outer);
+                false
+            }
+            crate::CollisionResult::Complete(_, _) => {
+                true
+            }
+            crate::CollisionResult::Error => {
+                tracing::warn!("unexpected issue with collision result for key: {key}");
+                return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
+            }
+        };
+        Ok(exists)
 
     }
 }
