@@ -5,3 +5,4 @@
 *.db
 /pbf_data
 /metadata
+/result
