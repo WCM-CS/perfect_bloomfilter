@@ -75,7 +75,7 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
     for (i, shard) in shards.iter().enumerate() {
 
 
-        let mut key_hashes = Vec::with_capacity(OUTER_BLOOM_HASH_FAMILY_SIZE as usize);
+        let mut key_hashes = Vec::with_capacity(hash_family_size as usize);
         let h1 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[0])?;
         let h2 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[1])?;
 
@@ -112,8 +112,8 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: FilterT
                 let mut locked_metadata = GLOBAL_METADATA.inner_metadata.blooms_key_count.write().unwrap();
                 
                 hashes.iter().for_each(|&bloom_index| {
-                locked_filter.set(bloom_index as usize, true);
-                locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                    locked_filter.set(bloom_index as usize, true);
+                    locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
                 });
             }
         }

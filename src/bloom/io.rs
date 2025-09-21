@@ -19,7 +19,7 @@ impl Default for IOCache {
 }
 
 impl IOCache { 
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             outer_cache: Arc::new(RwLock::new(HashMap::new())),
             inner_cache: Arc::new(RwLock::new(HashMap::new())),

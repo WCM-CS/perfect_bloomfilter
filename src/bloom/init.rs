@@ -3,7 +3,7 @@ use anyhow::{Result};
 use once_cell::sync::Lazy;
 use threadpool::ThreadPool;
 
-use crate::bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE}, outer_filters::OuterBlooms};
+use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE}, outer_filters::OuterBlooms}, metadata::meta::GLOBAL_METADATA};
 
 
 pub static GLOBAL_PBF: Lazy<PerfectBloomFilter> = Lazy::new(|| {
@@ -22,9 +22,10 @@ impl PerfectBloomFilter {
         let outer_filter = Arc::new(OuterBlooms::default());
         let inner_filter = Arc::new(InnerBlooms::default());
 
-        let pool = ThreadPool::new(2);
+        let drain_pool = ThreadPool::new(2);
+        let rehash_pool = ThreadPool::new(4);
 
-        pool.execute(move || {
+        drain_pool.execute(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
@@ -40,7 +41,7 @@ impl PerfectBloomFilter {
         });
 
 
-        pool.execute(move || {
+        drain_pool.execute(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
@@ -54,6 +55,30 @@ impl PerfectBloomFilter {
                 let _ = write_disk_io_cache(data, crate::FilterType::Inner);
             }
         });
+
+        rehash_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                // we need t get the bit vector length / the key count to check if for any shar dit droips below 19.2 then isnert that to the rehashing queue
+                let locked_metadata = GLOBAL_METADATA.outer_metadata.bloom_bit_length
+                let locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count
+
+
+                
+            }
+        });
+
+        rehash_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+
+
+                
+            }
+        });
+
+
+
         
         Self {
             outer_filter,
