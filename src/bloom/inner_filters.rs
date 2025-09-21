@@ -3,7 +3,7 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
-use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::inner_insert_disk_io_cache};
+use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::inner_insert_disk_io_cache, utils::metadata_computation};
 
 pub const INNER_ARRAY_SHARDS: u32 = 8192;
 
@@ -35,11 +35,13 @@ impl InnerBlooms {
             crate::CollisionResult::Zero => {
                 bloom_insert(&map, crate::FilterType::Inner);
                 inner_insert_disk_io_cache(key, &shards);
+                metadata_computation(shards, crate::FilterType::Inner);
                 false
             },
             crate::CollisionResult::Partial(_) => {
                 bloom_insert(&map, crate::FilterType::Inner);
                 inner_insert_disk_io_cache(key, &shards);
+                metadata_computation(shards, crate::FilterType::Inner);
                 false
             }
             crate::CollisionResult::Complete(_, _) => {

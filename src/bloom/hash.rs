@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::{self, init::GLOBAL_PBF, inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, utils::jump_hash_partition}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
+use crate::{bloom::{self, init::GLOBAL_PBF, inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, utils::{compare_high_low, hash_remainder, jump_hash_partition, partition_remainder, shift_right_bits}}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
 
 pub const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 pub const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
@@ -29,12 +29,12 @@ pub fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32
     let h1 =
             murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seed)?;
 
-    let high = (h1 >> 64) as u64;
+    let high = shift_right_bits(h1) as u64;
     let low = h1 as u64;
     let shard_size = mask / 2;
 
-    let p1 = jump_hash_partition(high ^ low, & (mask + 1))?;
-    let p2 = (p1 + shard_size) & mask;
+    let p1 = jump_hash_partition(compare_high_low(high, low), &(mask + 1))?;
+    let p2 = partition_remainder(p1 + shard_size, mask);
 
     debug_assert!(
         p1 != p2,
@@ -54,18 +54,18 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
     let (bitvec_lens, hash_seeds, hash_family_size) = match filter_type {
         FilterType::Outer => {
             let mut bitvec_lens: Vec<u64> = vec![];
-            let locked_meta = GLOBAL_METADATA.outer_metadata.bloom_bit_length.read().unwrap();
+
             for shard in shards {
-                let bit_len = locked_meta.get(shard).unwrap();
+                let bit_len = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length.read().unwrap();
                 bitvec_lens.push(*bit_len);
             }
             (bitvec_lens, [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], OUTER_BLOOM_HASH_FAMILY_SIZE)
         },
         FilterType::Inner => {
             let mut bitvec_lens: Vec<u64> = vec![];
-            let locked_meta = GLOBAL_METADATA.inner_metadata.bloom_bit_length.read().unwrap();
+            
             for shard in shards {
-                let bit_len = locked_meta.get(shard).unwrap();
+                let bit_len = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length.read().unwrap();
                 bitvec_lens.push(*bit_len);
             }
             (bitvec_lens, [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]], INNER_BLOOM_HASH_FAMILY_SIZE)
@@ -82,7 +82,8 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
         for idx in 0..hash_family_size {
             let idx_u128 = idx as u128;
             let mask = bitvec_lens.get(i).unwrap() - 1;
-            let index = (h1.wrapping_add(idx_u128.wrapping_mul(h2))) & mask as u128;
+            let base  = h1.wrapping_add(idx_u128.wrapping_mul(h2));
+            let index = hash_remainder(base, mask as u128);
 
             key_hashes.push(index as u64)
         }
@@ -100,20 +101,21 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: FilterT
         match filter_type {
             FilterType::Outer => {
                 let mut locked_filter = GLOBAL_PBF.outer_filter.filters[*idx as usize].write().unwrap();
-                let mut locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count.write().unwrap();
+                let mut locked_shard_key_count = GLOBAL_METADATA.outer_metadata.shards_metadata[*idx as usize].blooms_key_count.write().unwrap();
                 
                 hashes.iter().for_each(|&bloom_index| {
                     locked_filter.set(bloom_index as usize, true);
-                    locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                    *locked_shard_key_count += 1;
+                    
                 });
             },
             FilterType::Inner => {
                 let mut locked_filter = GLOBAL_PBF.inner_filter.filters[*idx as usize].write().unwrap();
-                let mut locked_metadata = GLOBAL_METADATA.inner_metadata.blooms_key_count.write().unwrap();
+                 let mut locked_shard_key_count = GLOBAL_METADATA.inner_metadata.shards_metadata[*idx as usize].blooms_key_count.write().unwrap();
                 
                 hashes.iter().for_each(|&bloom_index| {
                     locked_filter.set(bloom_index as usize, true);
-                    locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                    *locked_shard_key_count += 1;
                 });
             }
         }

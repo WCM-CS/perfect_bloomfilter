@@ -17,6 +17,8 @@ pub struct MetaData {
     pub(crate) inner_metadata: Arc<Meta>,
 }
 
+
+
 impl Default for MetaData {
     fn default() -> Self {
         Self::new()
@@ -36,11 +38,53 @@ impl MetaData {
 }
 
 pub struct Meta {
-    pub(crate) blooms_key_count: Arc<RwLock<HashMap<u32, u64>>>,
-    pub(crate) bloom_bit_length: Arc<RwLock<HashMap<u32, u64>>>,
-    pub(crate) bloom_bit_length_mult: Arc<RwLock<HashMap<u32, u32>>>,
+    pub(crate) shards_metadata: Arc<Vec<ShardMeta>>,
     pub(crate) array_shards: Arc<u32>,
 }
+
+pub struct ShardMeta {
+    pub blooms_key_count: RwLock<u64>,
+    pub bloom_bit_length: RwLock<u64>,
+    pub bloom_bit_length_mult: RwLock<u32>,
+}
+
+impl Meta {
+    fn new_outer() -> Self {
+        let mut shards_metadata = Vec::with_capacity(OUTER_ARRAY_SHARDS as usize);
+
+        for _ in 0..OUTER_ARRAY_SHARDS {
+            shards_metadata.push(ShardMeta {
+                blooms_key_count: RwLock::new(0),
+                bloom_bit_length: RwLock::new(OUTER_BLOOM_STARTING_LENGTH),
+                bloom_bit_length_mult: RwLock::new(OUTER_BLOOM_STARTING_MULT),
+            });
+        }
+
+        Self {
+            shards_metadata: Arc::new(shards_metadata),
+            array_shards: Arc::new(OUTER_ARRAY_SHARDS),
+        }
+    }
+
+    fn new_inner() -> Self {
+        let mut shards_metadata = Vec::with_capacity(INNER_ARRAY_SHARDS as usize);
+
+        for _ in 0..INNER_ARRAY_SHARDS {
+            shards_metadata.push(ShardMeta {
+                blooms_key_count: RwLock::new(0),
+                bloom_bit_length: RwLock::new(INNER_BLOOM_STARTING_LENGTH),
+                bloom_bit_length_mult: RwLock::new(INNER_BLOOM_STARTING_MULT),
+            });
+        }
+
+        Self {
+            shards_metadata: Arc::new(shards_metadata),
+            array_shards: Arc::new(INNER_ARRAY_SHARDS),
+        }
+    }
+}
+
+/*
 
 impl Meta {
     fn new_outer() -> Self {
@@ -81,3 +125,6 @@ impl Meta {
         }
     }
 }
+
+*/
+

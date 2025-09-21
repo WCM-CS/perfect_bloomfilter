@@ -1,15 +1,15 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
 use anyhow::{Result};
 use once_cell::sync::Lazy;
 use threadpool::ThreadPool;
+use rayon;
 
-use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE}, outer_filters::OuterBlooms}, metadata::meta::GLOBAL_METADATA};
+use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE, INNER_DRAIN_IN_PROGRESS, OUTER_DRAIN_IN_PROGRESS}, outer_filters::OuterBlooms, rehash::rehash_shards, utils::concurrecy_init}, metadata::meta::GLOBAL_METADATA};
 
 
 pub static GLOBAL_PBF: Lazy<PerfectBloomFilter> = Lazy::new(|| {
     PerfectBloomFilter::new()
 });
-
 
 
 pub struct PerfectBloomFilter {
@@ -22,14 +22,15 @@ impl PerfectBloomFilter {
         let outer_filter = Arc::new(OuterBlooms::default());
         let inner_filter = Arc::new(InnerBlooms::default());
 
-        let drain_pool = ThreadPool::new(2);
-        let rehash_pool = ThreadPool::new(4);
+        let sys_threads = concurrecy_init().unwrap();
+        let rehash_pool = rayon::ThreadPoolBuilder::new().num_threads(sys_threads - 1).build().unwrap();
 
-        drain_pool.execute(move || {
+        thread::spawn(move || {
             loop {
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(2));
 
-
+                OUTER_DRAIN_IN_PROGRESS.store(true, Ordering::SeqCst);
+              
                 let data = {
                     let mut locked_cache = GLOBAL_IO_CACHE.outer_cache.write().unwrap();
                     let cache_data = std::mem::take(&mut *locked_cache);
@@ -37,15 +38,9 @@ impl PerfectBloomFilter {
                 };
 
                 let _ = write_disk_io_cache(data, crate::FilterType::Outer);
-            }
-        });
+                OUTER_DRAIN_IN_PROGRESS.store(false, Ordering::SeqCst);
 
-
-        drain_pool.execute(move || {
-            loop {
-                thread::sleep(Duration::from_secs(5));
-
-
+                INNER_DRAIN_IN_PROGRESS.store(true, Ordering::SeqCst);
                 let data = {
                     let mut locked_cache = GLOBAL_IO_CACHE.inner_cache.write().unwrap();
                     let cache_data = std::mem::take(&mut *locked_cache);
@@ -53,25 +48,33 @@ impl PerfectBloomFilter {
                 };
 
                 let _ = write_disk_io_cache(data, crate::FilterType::Inner);
+
+                INNER_DRAIN_IN_PROGRESS.store(false, Ordering::SeqCst);
+
             }
         });
 
-        rehash_pool.execute(move || {
+        rehash_pool.install(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
-                // we need t get the bit vector length / the key count to check if for any shar dit droips below 19.2 then isnert that to the rehashing queue
-                let locked_metadata = GLOBAL_METADATA.outer_metadata.bloom_bit_length
-                let locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count
 
-
+                while OUTER_DRAIN_IN_PROGRESS.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10)); 
+                }
                 
+                let _ = rehash_shards(crate::FilterType::Outer);
             }
         });
 
-        rehash_pool.execute(move || {
+        rehash_pool.install(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
+                while INNER_DRAIN_IN_PROGRESS.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10)); 
+                }
+
+                let _ = rehash_shards(crate::FilterType::Inner);
 
                 
             }

@@ -3,7 +3,7 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
-use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::outer_insert_disk_io_cache};
+use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::outer_insert_disk_io_cache, utils::metadata_computation};
 
 pub const OUTER_ARRAY_SHARDS: u32 = 4096;
 
@@ -35,11 +35,13 @@ impl OuterBlooms {
             crate::CollisionResult::Zero => {
                 bloom_insert(&map, crate::FilterType::Outer);
                 outer_insert_disk_io_cache(key, &shards);
+                metadata_computation(shards, crate::FilterType::Outer);
                 false
             },
             crate::CollisionResult::Partial(_) => {
                 bloom_insert(&map, crate::FilterType::Outer);
                 outer_insert_disk_io_cache(key, &shards);
+                metadata_computation(shards, crate::FilterType::Outer);
                 false
             }
             crate::CollisionResult::Complete(_, _) => {
