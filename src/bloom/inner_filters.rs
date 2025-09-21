@@ -26,7 +26,7 @@ impl Default for InnerBlooms {
 }
 
 impl InnerBlooms {
-    pub fn contains_and_insert(key: &str) -> Result<bool> {
+    pub fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let shards = array_sharding_hash(key, crate::FilterType::Inner)?;
         let map = bloom_hash(&shards, key, crate::FilterType::Inner)?;
         let result = bloom_check(&map, crate::FilterType::Inner)?;

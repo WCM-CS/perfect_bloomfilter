@@ -18,14 +18,26 @@ pub struct PerfectBloomFilter {
 }
 
 impl PerfectBloomFilter {
+
+    pub fn system() -> &'static Self {
+        &*GLOBAL_PBF
+    }
+
     pub fn new() -> Self {
+        tracing::info!("Creating outer blooms");
         let outer_filter = Arc::new(OuterBlooms::default());
+        tracing::info!("Creating inner blooms");
         let inner_filter = Arc::new(InnerBlooms::default());
 
+        tracing::info!("Getting system concurrency ");
         let sys_threads = concurrecy_init().unwrap();
+
+        let drain_pool = ThreadPool::new(1);
         let rehash_pool = rayon::ThreadPoolBuilder::new().num_threads(sys_threads - 1).build().unwrap();
 
-        thread::spawn(move || {
+        tracing::info!("80% System threads: {sys_threads}");
+
+        drain_pool.execute(move || {
             loop {
                 thread::sleep(Duration::from_secs(2));
 
@@ -54,7 +66,8 @@ impl PerfectBloomFilter {
             }
         });
 
-        rehash_pool.install(move || {
+        
+        rehash_pool.spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
@@ -66,7 +79,7 @@ impl PerfectBloomFilter {
             }
         });
 
-        rehash_pool.install(move || {
+        rehash_pool.spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
@@ -79,7 +92,10 @@ impl PerfectBloomFilter {
                 
             }
         });
+    
 
+        
+    
 
 
         
@@ -89,7 +105,7 @@ impl PerfectBloomFilter {
         }
     }
 
-
+    /*
     pub fn contains_insert(&mut self, key: &str) -> Result<bool> {
         let outer_res = OuterBlooms::contains_and_insert(&key)?;
         let inner_res = InnerBlooms::contains_and_insert(&key)?;
@@ -97,6 +113,15 @@ impl PerfectBloomFilter {
         Ok(outer_res && inner_res)
         //Ok(true)
     }
+    
+     */
+    pub fn contains_insert(&self, key: &str) -> Result<bool> {
+        let outer_res = self.outer_filter.contains_and_insert(key)?;
+        let inner_res = self.inner_filter.contains_and_insert(key)?;
+
+        Ok(outer_res && inner_res)
+    }
+    
 }
 
 
@@ -120,7 +145,7 @@ mod tests {
 
     use once_cell::sync::Lazy;
 
-    use crate::bloom::init::PerfectBloomFilter;
+    use crate::bloom::init::{PerfectBloomFilter, GLOBAL_PBF};
 
     static COUNT: i32 = 1_500_000;
 
@@ -144,7 +169,8 @@ mod tests {
         }
        
         tracing::info!("Creating PerfectBloomFilter instance");
-        let mut pf = PerfectBloomFilter::new();
+        let pf = PerfectBloomFilter::system();
+        //let pf = &*GLOBAL_PBF;
 
         tracing::info!("PerfectBloomFilter created successfully");
         for i in 0..COUNT {
