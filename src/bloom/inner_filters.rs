@@ -3,13 +3,12 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
-use crate::bloom::hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert};
+use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::inner_insert_disk_io_cache};
 
 pub const INNER_ARRAY_SHARDS: u32 = 8192;
 
-pub const INNER_BLOOM_STARTING_MULT: u32 = 12;
-//pub const INNER_BLOOM_STARTING_LENGTH: u64 = 2_u64.pow( INNER_BLOOM_STARTING_MULT);
-pub const INNER_BLOOM_STARTING_LENGTH: u64 = 1 << INNER_BLOOM_STARTING_MULT;
+pub const INNER_BLOOM_STARTING_MULT: u32 = 16;
+pub const INNER_BLOOM_STARTING_LENGTH: u64 = 1u64 << INNER_BLOOM_STARTING_MULT;
 
 
 pub struct InnerBlooms {
@@ -19,13 +18,11 @@ pub struct InnerBlooms {
 impl Default for InnerBlooms {
     fn default() -> Self {
         let empty_bitvec = bitvec![0; INNER_BLOOM_STARTING_LENGTH as usize];
-        //let filters = std::array::from_fn(|_| RwLock::new(empty_bitvec.clone()));
         let filters = (0..INNER_ARRAY_SHARDS)
             .map(|_| RwLock::new(empty_bitvec.clone()))
             .collect();
         InnerBlooms { filters }
     }
-
 }
 
 impl InnerBlooms {
@@ -37,10 +34,12 @@ impl InnerBlooms {
         let exists = match result {
             crate::CollisionResult::Zero => {
                 bloom_insert(&map, crate::FilterType::Inner);
+                inner_insert_disk_io_cache(key, &shards);
                 false
             },
             crate::CollisionResult::Partial(_) => {
                 bloom_insert(&map, crate::FilterType::Inner);
+                inner_insert_disk_io_cache(key, &shards);
                 false
             }
             crate::CollisionResult::Complete(_, _) => {

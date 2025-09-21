@@ -33,7 +33,7 @@ pub fn array_sharding_hash(key: &str, filter_type: FilterType) -> Result<Vec<u32
     let low = h1 as u64;
     let shard_size = mask / 2;
 
-    let p1 = jump_hash_partition(high ^ low, &(mask + 1))?;
+    let p1 = jump_hash_partition(high ^ low, & (mask + 1))?;
     let p2 = (p1 + shard_size) & mask;
 
     debug_assert!(
@@ -96,26 +96,25 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: FilterType) -> Result<
 }
 
 pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: FilterType) {
-        for (idx, hashes) in shards_hashes {
-            match filter_type {
-                FilterType::Outer => {
-                    let mut locked_filter = GLOBAL_PBF.outer_filter.filters[*idx as usize].write().unwrap();
-                    let mut locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count.write().unwrap();
-                    
-                    hashes.iter().for_each(|&bloom_index| {
-                        locked_filter.set(bloom_index as usize, true);
-                        locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
-                    });
-                },
-                FilterType::Inner => {
-                    let mut locked_filter = GLOBAL_PBF.inner_filter.filters[*idx as usize].write().unwrap();
-                    let mut locked_metadata = GLOBAL_METADATA.inner_metadata.blooms_key_count.write().unwrap();
-                    
-                    hashes.iter().for_each(|&bloom_index| {
+    for (idx, hashes) in shards_hashes {
+        match filter_type {
+            FilterType::Outer => {
+                let mut locked_filter = GLOBAL_PBF.outer_filter.filters[*idx as usize].write().unwrap();
+                let mut locked_metadata = GLOBAL_METADATA.outer_metadata.blooms_key_count.write().unwrap();
+                
+                hashes.iter().for_each(|&bloom_index| {
                     locked_filter.set(bloom_index as usize, true);
                     locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
                 });
-            
+            },
+            FilterType::Inner => {
+                let mut locked_filter = GLOBAL_PBF.inner_filter.filters[*idx as usize].write().unwrap();
+                let mut locked_metadata = GLOBAL_METADATA.inner_metadata.blooms_key_count.write().unwrap();
+                
+                hashes.iter().for_each(|&bloom_index| {
+                locked_filter.set(bloom_index as usize, true);
+                locked_metadata.entry(*idx).and_modify(|count| *count += 1).or_insert(1);
+                });
             }
         }
     }

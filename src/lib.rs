@@ -11,6 +11,7 @@ pub enum CollisionResult {
     Error,
 }
 
+#[derive(Eq, Hash, PartialEq)]
 pub enum FilterType {
     Outer,
     Inner,

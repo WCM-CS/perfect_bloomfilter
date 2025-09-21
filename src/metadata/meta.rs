@@ -24,7 +24,7 @@ impl Default for MetaData {
 }
 
 impl MetaData {
-    pub fn new() -> Self {
+    fn new() -> Self {
         let outer_metadata = Arc::new(Meta::new_outer());
         let inner_metadata = Arc::new(Meta::new_inner());
 
@@ -38,8 +38,8 @@ impl MetaData {
 pub struct Meta {
     pub(crate) blooms_key_count: Arc<RwLock<HashMap<u32, u64>>>,
     pub(crate) bloom_bit_length: Arc<RwLock<HashMap<u32, u64>>>,
-    bloom_bit_length_mult: Arc<RwLock<HashMap<u32, u32>>>,
-    array_shards: Arc<u32>,
+    pub(crate) bloom_bit_length_mult: Arc<RwLock<HashMap<u32, u32>>>,
+    pub(crate) array_shards: Arc<u32>,
 }
 
 impl Meta {

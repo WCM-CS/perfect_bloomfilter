@@ -3,14 +3,12 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
-use crate::bloom::hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert};
-
-
+use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::outer_insert_disk_io_cache};
 
 pub const OUTER_ARRAY_SHARDS: u32 = 4096;
 
-pub const OUTER_BLOOM_STARTING_MULT: u32 = 13;
-pub const OUTER_BLOOM_STARTING_LENGTH: u64 = 1 << OUTER_BLOOM_STARTING_MULT;
+pub const OUTER_BLOOM_STARTING_MULT: u32 = 17;
+pub const OUTER_BLOOM_STARTING_LENGTH: u64 = 1u64 << OUTER_BLOOM_STARTING_MULT;
 
 
 pub struct OuterBlooms {
@@ -20,7 +18,6 @@ pub struct OuterBlooms {
 impl Default for OuterBlooms {
     fn default() -> Self {
         let empty_bitvec = bitvec![0; OUTER_BLOOM_STARTING_LENGTH as usize];
-        //let filters = std::array::from_fn(|_| RwLock::new(empty_bitvec.clone()));
         let filters = (0..OUTER_ARRAY_SHARDS)
             .map(|_| RwLock::new(empty_bitvec.clone()))
             .collect();
@@ -37,10 +34,12 @@ impl OuterBlooms {
         let exists = match result {
             crate::CollisionResult::Zero => {
                 bloom_insert(&map, crate::FilterType::Outer);
+                outer_insert_disk_io_cache(key, &shards);
                 false
             },
             crate::CollisionResult::Partial(_) => {
                 bloom_insert(&map, crate::FilterType::Outer);
+                outer_insert_disk_io_cache(key, &shards);
                 false
             }
             crate::CollisionResult::Complete(_, _) => {
