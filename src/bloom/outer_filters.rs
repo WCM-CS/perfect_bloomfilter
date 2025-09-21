@@ -7,7 +7,7 @@ use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_in
 
 pub const OUTER_ARRAY_SHARDS: u32 = 4096;
 
-pub const OUTER_BLOOM_STARTING_MULT: u32 = 17;
+pub const OUTER_BLOOM_STARTING_MULT: u32 = 13;
 pub const OUTER_BLOOM_STARTING_LENGTH: u64 = 1u64 << OUTER_BLOOM_STARTING_MULT;
 
 

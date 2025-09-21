@@ -1,6 +1,6 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::{self, BufRead, Cursor}, sync::{Arc, RwLock}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::{self, BufRead, Cursor}, sync::{Arc, Mutex, RwLock}};
 use anyhow::{Result, anyhow};
-use dashmap::DashSet;
+//use dashmap::DashSet;
 use once_cell::sync::Lazy;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use bitvec::vec::BitVec;
@@ -155,15 +155,17 @@ pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
         let future_bloom_length = power_of_two(*locked_bloom_len_mult + 1);
         let mut new_bloomfilter = bitvec![0; future_bloom_length as usize];
 
-        let key_dashmap: DashSet<String> = DashSet::with_capacity(capacity as usize);
+        //let key_dashmap: DashSet<String> = DashSet::with_capacity(capacity as usize);
+        let key_set = Arc::new(Mutex::new(HashSet::with_capacity(capacity as usize)));
+        let mut locked_key_set = key_set.lock().unwrap();
 
         for line in reader.lines() {
             let line_res = line.unwrap();
-            key_dashmap.insert(line_res);
+            locked_key_set.insert(line_res);
         }
 
 
-        key_dashmap.iter().for_each(|key| {
+        locked_key_set.iter().for_each(|key| {
             let hashes = bloom_rehash(&future_bloom_length, &key, &filter_type).unwrap();
             bloom_reinsert(&mut new_bloomfilter, &hashes);
         });
