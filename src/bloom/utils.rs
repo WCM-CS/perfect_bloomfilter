@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::rehash::{inner_insert_rehash_queue, outer_insert_rehash_queue, BLOOM_LENGTH_PER_KEY}, metadata::meta::GLOBAL_METADATA, FilterType};
+use crate::{bloom::rehash::{BLOOM_LENGTH_PER_KEY}, metadata::meta::GLOBAL_METADATA, FilterType};
 
 const JUMP_HASH_SHIFT: i32 = 33;
 const JUMP_HASH_CONSTANT: u64 = 2862933555777941757;
@@ -76,6 +76,8 @@ pub fn concurrecy_init() -> Result<usize> {
 }
 
 // metadata computation
+
+/*
 pub fn metadata_computation(shards: Vec<u32>, filter_type: FilterType) {
     match filter_type {
         FilterType::Outer => {
@@ -107,10 +109,8 @@ pub fn metadata_computation(shards: Vec<u32>, filter_type: FilterType) {
             inner_insert_rehash_queue(&rehash_shards);
         },
     }
-    
-    
-
-
 }
+ */
+
 
 

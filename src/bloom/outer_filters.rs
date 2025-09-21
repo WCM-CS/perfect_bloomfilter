@@ -3,11 +3,11 @@ use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 
-use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::outer_insert_disk_io_cache, rehash::wait_for_shard_rehash_completion, utils::metadata_computation};
+use crate::bloom::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert}, io::outer_insert_disk_io_cache};
 
 pub const OUTER_ARRAY_SHARDS: u32 = 4096;
 
-pub const OUTER_BLOOM_STARTING_MULT: u32 = 17;
+pub const OUTER_BLOOM_STARTING_MULT: u32 = 13;
 pub const OUTER_BLOOM_STARTING_LENGTH: u64 = 1u64 << OUTER_BLOOM_STARTING_MULT;
 
 
@@ -28,9 +28,6 @@ impl Default for OuterBlooms {
 impl OuterBlooms {
     pub fn contains_and_insert(&self, key: &str) -> Result<bool> {
         let shards = array_sharding_hash(key, crate::FilterType::Outer)?;
-
-        wait_for_shard_rehash_completion(&shards, &crate::FilterType::Outer);
-
         let map = bloom_hash(&shards, key, crate::FilterType::Outer)?;
         let result = bloom_check(&map, crate::FilterType::Outer)?;
 
@@ -38,13 +35,11 @@ impl OuterBlooms {
             crate::CollisionResult::Zero => {
                 bloom_insert(&map, crate::FilterType::Outer);
                 outer_insert_disk_io_cache(key, &shards);
-                metadata_computation(shards, crate::FilterType::Outer);
                 false
             },
             crate::CollisionResult::Partial(_) => {
                 bloom_insert(&map, crate::FilterType::Outer);
                 outer_insert_disk_io_cache(key, &shards);
-                metadata_computation(shards, crate::FilterType::Outer);
                 false
             }
             crate::CollisionResult::Complete(_, _) => {

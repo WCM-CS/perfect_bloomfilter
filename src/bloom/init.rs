@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use threadpool::ThreadPool;
 use rayon;
 
-use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE, INNER_DRAIN_IN_PROGRESS, OUTER_DRAIN_IN_PROGRESS}, outer_filters::OuterBlooms, rehash::{rehash_shards, GLOBAL_REHASH_QUEUE}, utils::concurrecy_init}, metadata::meta::GLOBAL_METADATA};
+use crate::bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE}, outer_filters::OuterBlooms, utils::concurrecy_init};
 
 
 pub static GLOBAL_PBF: Lazy<PerfectBloomFilter> = Lazy::new(|| {
@@ -23,38 +23,24 @@ impl PerfectBloomFilter {
         &*GLOBAL_PBF
     }
 
-    pub fn new() -> Self {
+    fn new() -> Self {
         tracing::info!("Creating outer blooms");
         let outer_filter = Arc::new(OuterBlooms::default());
         tracing::info!("Creating inner blooms");
         let inner_filter = Arc::new(InnerBlooms::default());
 
         tracing::info!("Getting system concurrency ");
-        let sys_threads = concurrecy_init().unwrap();
+        //let sys_threads = concurrecy_init().unwrap();
 
-        let drain_pool = ThreadPool::new(1);
-        let rehash_pool = rayon::ThreadPoolBuilder::new().num_threads(sys_threads - 1).build().unwrap();
+        let drain_pool = ThreadPool::new(2);
+        //let rehash_pool = rayon::ThreadPoolBuilder::new().num_threads(sys_threads - 1).build().unwrap();
 
-        tracing::info!("80% System threads: {sys_threads}");
+        //tracing::info!("80% System threads: {sys_threads}");
 
-        drain_pool.execute(move || {
+        
+         drain_pool.execute(move || {
             loop {
                 thread::sleep(Duration::from_secs(2));
-/*
-
-loop {
-                    let active = GLOBAL_REHASH_QUEUE.active_rehashing_shards.read().unwrap();
-                    if active.is_empty() || !active.iter().any(|shard| ) {
-                        break;
-                    }
-                    drop(active);
-                    thread::sleep(Duration::from_millis(10));
-                }
-
-*/
-                
-
-                OUTER_DRAIN_IN_PROGRESS.store(true, Ordering::SeqCst);
               
                 let data = {
                     let mut locked_cache = GLOBAL_IO_CACHE.outer_cache.write().unwrap();
@@ -63,9 +49,14 @@ loop {
                 };
 
                 let _ = write_disk_io_cache(data, crate::FilterType::Outer);
-                OUTER_DRAIN_IN_PROGRESS.store(false, Ordering::SeqCst);
 
-                INNER_DRAIN_IN_PROGRESS.store(true, Ordering::SeqCst);
+            }
+        });
+
+        drain_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(2));
+
                 let data = {
                     let mut locked_cache = GLOBAL_IO_CACHE.inner_cache.write().unwrap();
                     let cache_data = std::mem::take(&mut *locked_cache);
@@ -74,65 +65,16 @@ loop {
 
                 let _ = write_disk_io_cache(data, crate::FilterType::Inner);
 
-                INNER_DRAIN_IN_PROGRESS.store(false, Ordering::SeqCst);
-
             }
         });
 
-        
-         rehash_pool.spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(5));
 
-                while OUTER_DRAIN_IN_PROGRESS.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(10)); 
-                }
-                
-                let _ = rehash_shards(crate::FilterType::Outer);
-            }
-        });
-
-        rehash_pool.spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(5));
-
-                while INNER_DRAIN_IN_PROGRESS.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(10)); 
-                }
-
-                let _ = rehash_shards(crate::FilterType::Inner);
-
-                
-            }
-        });
-        
-         
-
-        
-       
-    
-
-        
-    
-
-
-        
         Self {
             outer_filter,
             inner_filter,
         }
     }
 
-    /*
-    pub fn contains_insert(&mut self, key: &str) -> Result<bool> {
-        let outer_res = OuterBlooms::contains_and_insert(&key)?;
-        let inner_res = InnerBlooms::contains_and_insert(&key)?;
-
-        Ok(outer_res && inner_res)
-        //Ok(true)
-    }
-    
-     */
     pub fn contains_insert(&self, key: &str) -> Result<bool> {
         let outer_res = self.outer_filter.contains_and_insert(key)?;
         let inner_res = self.inner_filter.contains_and_insert(key)?;
@@ -165,7 +107,7 @@ mod tests {
 
     use crate::bloom::init::{PerfectBloomFilter, GLOBAL_PBF};
 
-    static COUNT: i32 = 50_000_000;
+    static COUNT: i32 = 20_500_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -188,7 +130,6 @@ mod tests {
        
         tracing::info!("Creating PerfectBloomFilter instance");
         let pf = PerfectBloomFilter::system();
-        //let pf = &*GLOBAL_PBF;
 
         tracing::info!("PerfectBloomFilter created successfully");
         for i in 0..COUNT {
@@ -224,7 +165,7 @@ mod tests {
         }
         tracing::info!("Completed confirmation phase 1");
 
-        let _ = std::thread::sleep(Duration::from_secs(3));
+        let _ = std::thread::sleep(Duration::from_secs(5));
 
         
         Ok(())

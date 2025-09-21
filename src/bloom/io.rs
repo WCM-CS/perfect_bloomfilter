@@ -4,8 +4,6 @@ use once_cell::sync::Lazy;
 use crate::{metadata::meta::GLOBAL_METADATA, FilterType};
 
 pub static GLOBAL_IO_CACHE: Lazy<IOCache> = Lazy::new(|| IOCache::new());
-pub static OUTER_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-pub static INNER_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 // going from one to two caches reduces time from 236 to 182 seconds 
 // Potentially shard this to a further degree for better performance optimization by reducing lock contention further
