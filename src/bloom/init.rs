@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use threadpool::ThreadPool;
 use rayon;
 
-use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE, INNER_DRAIN_IN_PROGRESS, OUTER_DRAIN_IN_PROGRESS}, outer_filters::OuterBlooms, rehash::rehash_shards, utils::concurrecy_init}, metadata::meta::GLOBAL_METADATA};
+use crate::{bloom::{inner_filters::InnerBlooms, io::{write_disk_io_cache, GLOBAL_IO_CACHE, INNER_DRAIN_IN_PROGRESS, OUTER_DRAIN_IN_PROGRESS}, outer_filters::OuterBlooms, rehash::{rehash_shards, GLOBAL_REHASH_QUEUE}, utils::concurrecy_init}, metadata::meta::GLOBAL_METADATA};
 
 
 pub static GLOBAL_PBF: Lazy<PerfectBloomFilter> = Lazy::new(|| {
@@ -40,6 +40,19 @@ impl PerfectBloomFilter {
         drain_pool.execute(move || {
             loop {
                 thread::sleep(Duration::from_secs(2));
+/*
+
+loop {
+                    let active = GLOBAL_REHASH_QUEUE.active_rehashing_shards.read().unwrap();
+                    if active.is_empty() || !active.iter().any(|shard| ) {
+                        break;
+                    }
+                    drop(active);
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+*/
+                
 
                 OUTER_DRAIN_IN_PROGRESS.store(true, Ordering::SeqCst);
               
@@ -67,11 +80,11 @@ impl PerfectBloomFilter {
         });
 
         
-        rehash_pool.spawn(move || {
+         rehash_pool.spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
-                while OUTER_DRAIN_IN_PROGRESS.load(Ordering::Relaxed) {
+                while OUTER_DRAIN_IN_PROGRESS.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(10)); 
                 }
                 
@@ -83,7 +96,7 @@ impl PerfectBloomFilter {
             loop {
                 thread::sleep(Duration::from_secs(5));
 
-                while INNER_DRAIN_IN_PROGRESS.load(Ordering::Relaxed) {
+                while INNER_DRAIN_IN_PROGRESS.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(10)); 
                 }
 
@@ -92,6 +105,11 @@ impl PerfectBloomFilter {
                 
             }
         });
+        
+         
+
+        
+       
     
 
         
@@ -147,7 +165,7 @@ mod tests {
 
     use crate::bloom::init::{PerfectBloomFilter, GLOBAL_PBF};
 
-    static COUNT: i32 = 1_500_000;
+    static COUNT: i32 = 50_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -176,7 +194,12 @@ mod tests {
         for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
+            if i % 100_000 == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+
             if was_present {
+                std::thread::sleep(Duration::from_secs(3));
                 tracing::error!("Insertion Phase Failed at key {}", i);
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -190,6 +213,12 @@ mod tests {
         for i in 0..COUNT {
             let key = i.to_string();
             let was_present = pf.contains_insert(&key)?;
+
+            if !was_present {
+                std::thread::sleep(Duration::from_secs(3));
+                tracing::error!("Confirmation Phase Failed at key {}", i);
+                std::thread::sleep(Duration::from_millis(500));
+            }
 
             assert_eq!(was_present, true);
         }

@@ -1,8 +1,8 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::{self, BufRead, Cursor}, sync::{Arc, Mutex, RwLock}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::{self, BufRead, Cursor}, sync::{Arc, Mutex, RwLock, RwLockWriteGuard}};
 use anyhow::{Result, anyhow};
 //use dashmap::DashSet;
 use once_cell::sync::Lazy;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 
@@ -11,7 +11,7 @@ use crate::{bloom::{hash::{HASH_SEED_SELECTION, INNER_BLOOM_HASH_FAMILY_SIZE, OU
 
 
 pub const BLOOM_LENGTH_PER_KEY: f64 = 19.2;
-const REHASH_BATCH_SIZE: u32 = 5;
+const REHASH_BATCH_SIZE: u32 = 10;
 
 pub static GLOBAL_REHASH_QUEUE: Lazy<RehashQueue> = Lazy::new(|| RehashQueue::new());
 
@@ -21,6 +21,9 @@ pub struct RehashQueue {
 
     pub(crate) outer_queue_list: Arc<RwLock<HashSet<u32>>>,
     pub(crate) inner_queue_list: Arc<RwLock<HashSet<u32>>>,
+
+    pub(crate) outer_active_shards: Arc<RwLock<HashSet<u32>>>,
+    pub(crate) inner_active_shards: Arc<RwLock<HashSet<u32>>>,
 }
 
 impl Default for RehashQueue {
@@ -37,6 +40,8 @@ impl RehashQueue {
             inner_queue: Arc::new(RwLock::new(VecDeque::new())),
             outer_queue_list: Arc::new(RwLock::new(HashSet::new())),
             inner_queue_list: Arc::new(RwLock::new(HashSet::new())),
+            outer_active_shards: Arc::new(RwLock::new(HashSet::new())),
+            inner_active_shards: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
@@ -90,8 +95,112 @@ pub fn inner_insert_rehash_queue(shards: &[u32]) {
 }
 
 
-pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
+pub fn rehash_shards(filter_type: FilterType) -> Result<()> {
     let (shards, filter) = match filter_type {
+        FilterType::Outer => {
+            let mut rehash_shards = Vec::new();
+            let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.outer_queue.write().unwrap();
+
+            for _ in 0..REHASH_BATCH_SIZE {
+                if let Some(shard) = locked_rehash_queue.pop_front() {
+                    rehash_shards.push(shard);
+                }
+            }
+            (rehash_shards, "outer".to_string())
+        }
+        FilterType::Inner => {
+            let mut rehash_shards = Vec::new();
+            let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.inner_queue.write().unwrap();
+
+            for _ in 0..REHASH_BATCH_SIZE {
+                if let Some(shard) = locked_rehash_queue.pop_front() {
+                    rehash_shards.push(shard);
+                }
+            }
+            (rehash_shards, "inner".to_string())
+        }
+    };
+
+    // No upfront acquisition of write guards
+
+    shards.par_iter().for_each(|shard| {
+        let file_name = format!("./data/pbf_data/{}_{}.txt", filter, shard);
+        let file = match fs::OpenOptions::new().read(true).open(&file_name) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Failed to open file {}: {}", file_name, e);
+                return;
+            }
+        };
+        let reader = io::BufReader::new(file);
+
+        // Acquire all necessary locks inside the thread/task
+        match filter_type {
+            FilterType::Outer => {
+                let mut locked_shard = GLOBAL_PBF.outer_filter.filters[*shard as usize].write().unwrap();
+                let mut locked_bloom_len = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
+                let mut locked_bloom_len_mult = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
+
+                let future_bloom_length = power_of_two(*locked_bloom_len_mult + 1);
+                let mut new_bloomfilter = bitvec![0; future_bloom_length as usize];
+
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        if let Ok(hashes) = bloom_rehash(&future_bloom_length, &line, &filter_type) {
+                            bloom_reinsert(&mut new_bloomfilter, &hashes);
+                        }
+                    }
+                }
+
+                *locked_shard = new_bloomfilter;
+                *locked_bloom_len = future_bloom_length;
+                *locked_bloom_len_mult += 1;
+
+                let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.outer_queue_list.write().unwrap();
+                locked_rehash_list.remove(shard);
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.outer_active_shards.write().unwrap();
+                locked_rehash_queue.remove(shard);
+            }
+            FilterType::Inner => {
+                let mut locked_shard = GLOBAL_PBF.inner_filter.filters[*shard as usize].write().unwrap();
+                let mut locked_bloom_len = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
+                let mut locked_bloom_len_mult = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
+
+                let future_bloom_length = power_of_two(*locked_bloom_len_mult + 1);
+                let mut new_bloomfilter = bitvec![0; future_bloom_length as usize];
+
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        if let Ok(hashes) = bloom_rehash(&future_bloom_length, &line, &filter_type) {
+                            bloom_reinsert(&mut new_bloomfilter, &hashes);
+                        }
+                    }
+                }
+
+                *locked_shard = new_bloomfilter;
+                *locked_bloom_len = future_bloom_length;
+                *locked_bloom_len_mult += 1;
+
+                let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.inner_queue_list.write().unwrap();
+                locked_rehash_list.remove(shard);
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.inner_active_shards.write().unwrap();
+                locked_rehash_queue.remove(shard);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/*
+
+
+pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
+    let (
+        shards, 
+        filter
+    ) = match filter_type {
+
         FilterType::Outer => {
             let mut rehash_shards: Vec<u32> = vec![];
             let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.outer_queue.write().unwrap();
@@ -100,7 +209,7 @@ pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
                 if let Some(shard) = locked_rehash_queue.pop_front() {
                     rehash_shards.push(shard);
                 }
-            }
+            } 
 
             (rehash_shards, "outer".to_string())
         },
@@ -118,33 +227,49 @@ pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
         },
     };
 
-    shards.par_iter().for_each(|shard| {
-        let (mut locked_shard, capacity) = if &filter == "outer" {
-            let locked_shard = GLOBAL_PBF.outer_filter.filters[*shard as usize].write().unwrap();
-            let shard_capacity = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].blooms_key_count.read().unwrap();
+    let mut shard_locks: Vec<(
+        RwLockWriteGuard<'_, BitVec>,
+        RwLockWriteGuard<'_, u64>,
+        RwLockWriteGuard<'_, u32>,
+    )> = Vec::new();
+
+    for shard in shards.iter() {
+        let tuple = match filter_type {
+            FilterType::Outer => {
+                let locked_shard = GLOBAL_PBF.outer_filter.filters[*shard as usize].write().unwrap();
+                let locked_bloom_len = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
+                let locked_bloom_len_mult = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
+
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.outer_active_shards.write().unwrap();
+                locked_rehash_queue.insert(*shard);
+
+                (locked_shard, locked_bloom_len, locked_bloom_len_mult)
+            },
+            FilterType::Inner => {
+                let locked_shard = GLOBAL_PBF.inner_filter.filters[*shard as usize].write().unwrap();
+                //let shard_capacity = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].blooms_key_count.read().unwrap();
+                let locked_bloom_len = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
+                let locked_bloom_len_mult = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
             
-            (locked_shard, shard_capacity.clone())
-        } else {
-            let locked_shard = GLOBAL_PBF.inner_filter.filters[*shard as usize].write().unwrap();
-            let shard_capacity = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].blooms_key_count.read().unwrap();
-            
-            (locked_shard, shard_capacity.clone())
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.inner_active_shards.write().unwrap();
+                locked_rehash_queue.insert(*shard);
+
+                (locked_shard, locked_bloom_len, locked_bloom_len_mult)
+            },
         };
 
-        let (mut locked_bloom_len, mut locked_bloom_len_mult) = if &filter == "outer" {
-            let locked_bloom_len = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
-            let locked_bloom_len_mult = GLOBAL_METADATA.outer_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
+        shard_locks.push(tuple);
+    }
 
-            (locked_bloom_len, locked_bloom_len_mult)
+    
+
+
+    shards.par_iter().enumerate().for_each(|(idx, shard)|{
+
+        //let (mut locked_shard, _capacity, mut locked_bloom_len, mut locked_bloom_len_mult) = &mut shard_locks[idx];
+        let (locked_shard, locked_bloom_len, locked_bloom_len_mult) = &mut shard_locks[idx];
+         
         
-        } else {
-            let locked_bloom_len = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length.write().unwrap();
-            let locked_bloom_len_mult = GLOBAL_METADATA.inner_metadata.shards_metadata[*shard as usize].bloom_bit_length_mult.write().unwrap();
-            
-            (locked_bloom_len, locked_bloom_len_mult)
-        };
-
-
 
         let file_name = format!("./data/pbf_data/{}_{}.txt", filter, shard);
         let file = fs::OpenOptions::new()
@@ -152,41 +277,55 @@ pub fn rehash_shards(filter_type: FilterType) -> Result<()>  {
                 .open(&file_name).unwrap();
         let reader = io::BufReader::new(file);
 
-        let future_bloom_length = power_of_two(*locked_bloom_len_mult + 1);
+        let future_bloom_length = power_of_two(locked_bloom_len_mult.clone() + 1);
         let mut new_bloomfilter = bitvec![0; future_bloom_length as usize];
 
-        //let key_dashmap: DashSet<String> = DashSet::with_capacity(capacity as usize);
-        let key_set = Arc::new(Mutex::new(HashSet::with_capacity(capacity as usize)));
-        let mut locked_key_set = key_set.lock().unwrap();
-
         for line in reader.lines() {
-            let line_res = line.unwrap();
-            locked_key_set.insert(line_res);
+            match line {
+                Ok(line) => {
+                    //tracing::info!("Rehashing key: {line} into shard: {shard}");
+                    let hashes = bloom_rehash(&future_bloom_length, &line, &filter_type).unwrap();
+                    bloom_reinsert(&mut new_bloomfilter, &hashes);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read line during rehash: {}", e);
+                }
+            }
         }
 
 
-        locked_key_set.iter().for_each(|key| {
-            let hashes = bloom_rehash(&future_bloom_length, &key, &filter_type).unwrap();
-            bloom_reinsert(&mut new_bloomfilter, &hashes);
-        });
+       // locked_shard 
+        //locked_bloom_len = future_bloom_length;
+        //locked_bloom_len_mult = *locked_bloom_len_mult + 1;
 
-        *locked_shard = new_bloomfilter;
-        *locked_bloom_len = future_bloom_length;
-        *locked_bloom_len_mult = *locked_bloom_len_mult + 1;
+        match filter_type {
+            FilterType::Outer => {
+                drop(locked_shard);
+                let locked_shard = GLOBAL_PBF.outer_filter.filters[*shard as usize].write().unwrap();
 
-        if &filter == "outer" {
-            let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.outer_queue_list.write().unwrap();
-            locked_rehash_list.remove(shard);
-        } else {
-            let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.inner_queue_list.write().unwrap();
-            locked_rehash_list.remove(shard);
+
+
+
+                let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.outer_queue_list.write().unwrap();
+                locked_rehash_list.remove(shard);
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.outer_active_shards.write().unwrap();
+                locked_rehash_queue.remove(shard);
+            },
+            FilterType::Inner => {
+                let mut locked_rehash_list = GLOBAL_REHASH_QUEUE.inner_queue_list.write().unwrap();
+                locked_rehash_list.remove(shard);
+                let mut locked_rehash_queue = GLOBAL_REHASH_QUEUE.inner_active_shards.write().unwrap();
+                locked_rehash_queue.remove(shard);
+            },
         }
-
     });
     
 
     Ok(())
 }
+
+*/
+
 
 
 fn bloom_rehash(bloomfilter_length: &u64, key: &str, filter_type: &FilterType) -> Result<Vec<u64>> {
@@ -224,6 +363,32 @@ fn bloom_reinsert(filter: &mut BitVec, hashes: &Vec<u64>) {
         filter.set(*idx as usize, true);
     });
 }
+
+pub fn wait_for_shard_rehash_completion(shards: &[u32], filter_type: &FilterType) {
+    match filter_type {
+        FilterType::Outer => {
+            loop {
+                let active = GLOBAL_REHASH_QUEUE.outer_active_shards.read().unwrap();
+                if shards.iter().all(|s| !active.contains(s)) {
+                    break;
+                }
+                drop(active);
+                std::thread::yield_now(); 
+            }
+        }
+        FilterType::Inner => {
+            loop {
+                let active = GLOBAL_REHASH_QUEUE.inner_active_shards.read().unwrap();
+                if shards.iter().all(|s| !active.contains(s)) {
+                    break;
+                }
+                drop(active);
+                std::thread::yield_now(); 
+            }
+        }
+    }
+}
+
 
 
 

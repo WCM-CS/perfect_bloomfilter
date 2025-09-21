@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fs, io::{self, Write}, sync::{atomic::AtomicBool, Arc, RwLock}};
+use std::{collections::HashMap, fs, io::{self, Write}, path::Path, sync::{atomic::AtomicBool, Arc, RwLock}};
 use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
-use crate::FilterType;
+use crate::{metadata::meta::GLOBAL_METADATA, FilterType};
 
 pub static GLOBAL_IO_CACHE: Lazy<IOCache> = Lazy::new(|| IOCache::new());
 pub static OUTER_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -75,4 +75,5 @@ pub fn write_disk_io_cache(filter_map: HashMap<u32, Vec<String>>, filter_type: F
 
     Ok(())
 }
+
 

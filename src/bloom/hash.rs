@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::{self, init::GLOBAL_PBF, inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, utils::{compare_high_low, hash_remainder, jump_hash_partition, partition_remainder, shift_right_bits}}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
+use crate::{bloom::{self, init::GLOBAL_PBF, inner_filters::INNER_ARRAY_SHARDS, outer_filters::OUTER_ARRAY_SHARDS, rehash::GLOBAL_REHASH_QUEUE, utils::{compare_high_low, hash_remainder, jump_hash_partition, partition_remainder, shift_right_bits}}, metadata::meta::GLOBAL_METADATA, CollisionResult, FilterType};
 
 pub const OUTER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
 pub const INNER_BLOOM_HASH_FAMILY_SIZE: u32 = 7;
@@ -111,7 +111,7 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: FilterT
             },
             FilterType::Inner => {
                 let mut locked_filter = GLOBAL_PBF.inner_filter.filters[*idx as usize].write().unwrap();
-                 let mut locked_shard_key_count = GLOBAL_METADATA.inner_metadata.shards_metadata[*idx as usize].blooms_key_count.write().unwrap();
+                let mut locked_shard_key_count = GLOBAL_METADATA.inner_metadata.shards_metadata[*idx as usize].blooms_key_count.write().unwrap();
                 
                 hashes.iter().for_each(|&bloom_index| {
                     locked_filter.set(bloom_index as usize, true);
