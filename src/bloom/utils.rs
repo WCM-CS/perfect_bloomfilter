@@ -75,42 +75,6 @@ pub fn concurrecy_init() -> Result<usize> {
     Ok(usable_system_threads)
 }
 
-// metadata computation
-
-/*
-pub fn metadata_computation(shards: Vec<u32>, filter_type: FilterType) {
-    match filter_type {
-        FilterType::Outer => {
-            let mut rehash_shards = vec![];
-            for shard in shards {
-                let locked_shard_key_count = GLOBAL_METADATA.outer_metadata.shards_metadata[shard as usize].blooms_key_count.read().unwrap();
-                let locked_shard_bloom_len = GLOBAL_METADATA.outer_metadata.shards_metadata[shard as usize].bloom_bit_length.read().unwrap();
-                
-                let bit_len_per_key = (*locked_shard_bloom_len as f64) / (*locked_shard_key_count as f64);
-
-                if bit_len_per_key <= BLOOM_LENGTH_PER_KEY {
-                    rehash_shards.push(shard);
-                }
-            }
-            outer_insert_rehash_queue(&rehash_shards);
-        },
-        FilterType::Inner => {
-            let mut rehash_shards = vec![];
-            for shard in shards {
-                let locked_shard_key_count = GLOBAL_METADATA.inner_metadata.shards_metadata[shard as usize].blooms_key_count.read().unwrap();
-                let locked_shard_bloom_len = GLOBAL_METADATA.inner_metadata.shards_metadata[shard as usize].bloom_bit_length.read().unwrap();
-                
-                let bit_len_per_key = (*locked_shard_bloom_len as f64) / (*locked_shard_key_count as f64);
-
-                if bit_len_per_key <= BLOOM_LENGTH_PER_KEY {
-                    rehash_shards.push(shard);
-                }
-            }
-            inner_insert_rehash_queue(&rehash_shards);
-        },
-    }
-}
- */
 
 
 

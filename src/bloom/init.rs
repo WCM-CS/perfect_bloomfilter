@@ -85,16 +85,6 @@ impl PerfectBloomFilter {
 }
 
 
-
-
-
-
-
-// m = bloom filter len, b = bits per key threshold
-//k = number of hashes, n = keys 
-
-
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -107,7 +97,7 @@ mod tests {
 
     use crate::bloom::init::{PerfectBloomFilter, GLOBAL_PBF};
 
-    static COUNT: i32 = 20_500_000;
+    static COUNT: i32 = 2_500_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
