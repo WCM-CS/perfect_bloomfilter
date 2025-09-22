@@ -1,12 +1,10 @@
+use std::{collections::HashMap};
 use anyhow::{Result, anyhow};
 
-use crate::{bloom::rehash::{BLOOM_LENGTH_PER_KEY}, metadata::meta::GLOBAL_METADATA, FilterType};
 
 const JUMP_HASH_SHIFT: i32 = 33;
 const JUMP_HASH_CONSTANT: u64 = 2862933555777941757;
 const JUMP: f64 = (1u64 << 31) as f64;
-
-// BitOps
 
 //Left Shift
 pub fn power_of_two(x: u32) -> u64{
@@ -76,5 +74,34 @@ pub fn concurrecy_init() -> Result<usize> {
 }
 
 
+pub enum CollisionResult {
+    Zero,
+    Partial(u32),
+    Complete(u32, u32),
+    Error,
+}
 
+pub fn process_collisions(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
+    let mut collided: Vec<u32> = vec![];
 
+    map.iter().for_each(|(idx, res)| {
+        if *res {
+            collided.push(*idx);
+        }
+    });
+
+    let collision_result = match collided.as_slice() {
+        [] => CollisionResult::Zero,
+        [one] => CollisionResult::Partial(*one),
+        [one, two] => CollisionResult::Complete(*one, *two),
+        _ => CollisionResult::Error,
+    };
+
+    Ok(collision_result)
+}
+
+#[derive(Eq, Hash, PartialEq)]
+pub enum FilterType {
+    Outer,
+    Inner,
+}
