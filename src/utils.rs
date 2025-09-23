@@ -7,26 +7,26 @@ const JUMP_HASH_CONSTANT: u64 = 2862933555777941757;
 const JUMP: f64 = (1u64 << 31) as f64;
 
 //Left Shift
-pub fn power_of_two(x: u32) -> u64{
+pub fn bitwise_left_shift(x: u32) -> u64{
    1_u64 << x
 }
 
 // Right Shift
-pub fn shift_right_bits(x: u128) -> u128{
+pub fn bitwise_right_shift(x: u128) -> u128{
     x >> 64
 }
 
 // Bitwise XOR
-pub fn compare_high_low(high: u64, low: u64) -> u64{
+pub fn bitwise_xor(high: u64, low: u64) -> u64{
     high ^ low
 }
 
 // Bitwise AND
-pub fn partition_remainder(base: u32, mask: u32) -> u32{
+pub fn bitwise_and_u32(base: u32, mask: u32) -> u32{
     base & mask
 }
 
-pub fn hash_remainder(base: u128, mask: u128) -> u64{
+pub fn bitwise_and_u64(base: u128, mask: u128) -> u64{
     (base & mask) as u64
 }
 
