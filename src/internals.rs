@@ -4,7 +4,7 @@ use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 
-use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, contains_and_insert, INNER_ARRAY_SHARDS, INNER_BLOOM_STARTING_LENGTH, INNER_BLOOM_STARTING_MULT, OUTER_ARRAY_SHARDS, OUTER_BLOOM_STARTING_LENGTH, OUTER_BLOOM_STARTING_MULT}, utils::{CollisionResult, FilterType}};
+use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, HASH_SEED_SELECTION, INNER_ARRAY_SHARDS, INNER_BLOOM_HASH_FAMILY_SIZE, INNER_BLOOM_STARTING_LENGTH, INNER_BLOOM_STARTING_MULT, OUTER_ARRAY_SHARDS, OUTER_BLOOM_HASH_FAMILY_SIZE, OUTER_BLOOM_STARTING_LENGTH, OUTER_BLOOM_STARTING_MULT}, utils::{hash_remainder, CollisionResult, FilterType}};
 
 
 pub static GLOBAL_PBF: Lazy<PerfectBloomFilter> = Lazy::new(|| {
@@ -40,11 +40,42 @@ impl PerfectBloomFilter {
     }
 
     pub fn contains_and_insert(&self, key: &str) -> Result<bool> {
-        let outer = contains_and_insert(key, &FilterType::Outer)?;
-        let inner = contains_and_insert(key, &FilterType::Inner)?;
+        let outer = Self::contains_insert(key, &FilterType::Outer)?;
+        let inner = Self::contains_insert(key, &FilterType::Inner)?;
       
         Ok(inner & outer)
     }
+
+    
+
+    fn contains_insert(key: &str, filter_type: &FilterType) -> Result<bool>{
+        let shards = array_sharding_hash(key, filter_type)?;
+        let shards_hashes = bloom_hash(&shards, key, filter_type)?;
+        
+        let collision_results = bloom_check(&shards_hashes, filter_type)?;
+
+        let exists = match collision_results {
+            CollisionResult::Zero => {
+                bloom_insert(&shards_hashes, filter_type);
+                false
+            },
+            CollisionResult::Partial(_) => {
+                bloom_insert(&shards_hashes, filter_type);
+                false
+            }
+            CollisionResult::Complete(_, _) => {
+                true
+            }
+            CollisionResult::Error => {
+                tracing::warn!("unexpected issue with collision result for key: {key}");
+                return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
+            }
+        };
+        
+        Ok(exists)
+        
+    }
+
 }
 
 // Shard data grouped in a vector index
@@ -87,4 +118,5 @@ impl ShardData {
             },
         }
     }
+
 }

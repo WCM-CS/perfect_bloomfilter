@@ -56,11 +56,10 @@ pub fn array_sharding_hash(key: &str, filter_type: &FilterType) -> Result<Vec<u3
 
     Ok(vec![p1, p2])
 
-
 }
 
 
-// Kirsch-Mitzenmacher optimization 
+
 pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result<HashMap<u32, Vec<u64>>> {
     let mut hash_list = HashMap::new();
     
@@ -85,14 +84,16 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
         }
     };
 
+    
+    let h1 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[0])?;
+    let h2 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[1])?;
+
     for (i, shard) in shards.iter().enumerate() {
         let mut key_hashes = Vec::with_capacity(hash_family_size as usize);
-        let h1 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[0])?;
-        let h2 = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), hash_seeds[1])?;
-
         for idx in 0..hash_family_size {
             let idx_u128 = idx as u128;
             let mask = bitvec_lens.get(i).unwrap() - 1;
+            // Kirsch-Mitzenmacher optimization 
             let base  = h1.wrapping_add(idx_u128.wrapping_mul(h2));
             let index = hash_remainder(base, mask as u128);
 
@@ -153,35 +154,6 @@ pub fn bloom_check(map: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Re
     }
 
     Ok(process_collisions(&collision_map)?)
-
 }
 
-
-
-pub fn contains_and_insert(key: &str, filter_type: &FilterType) -> Result<bool>{
-        let shards = array_sharding_hash(key, filter_type)?;
-        let shards_hashes = bloom_hash(&shards, key, filter_type)?;
-        let collision_results = bloom_check(&shards_hashes, filter_type)?;
-
-        let exists = match collision_results {
-            CollisionResult::Zero => {
-                bloom_insert(&shards_hashes, filter_type);
-                false
-            },
-            CollisionResult::Partial(_) => {
-                bloom_insert(&shards_hashes, filter_type);
-                false
-            }
-            CollisionResult::Complete(_, _) => {
-                true
-            }
-            CollisionResult::Error => {
-                tracing::warn!("unexpected issue with collision result for key: {key}");
-                return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
-            }
-        };
-        
-    Ok(exists)
-       
-}
 
