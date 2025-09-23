@@ -1,10 +1,11 @@
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::{collections::HashMap, sync::{Arc, RwLock, RwLockWriteGuard}, thread, time::Duration};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
 use once_cell::sync::{Lazy, OnceCell};
+use threadpool::ThreadPool;
 
-use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, ARRAY_SHARDS, BLOOM_HASH_FAMILY_SIZE, BLOOM_STARTING_LENGTH, BLOOM_STARTING_MULT}, utils::{concurrecy_init, CollisionResult, FilterType}};
+use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, ARRAY_SHARDS, BLOOM_HASH_FAMILY_SIZE, BLOOM_STARTING_LENGTH, BLOOM_STARTING_MULT}, io::{drain_cache, insert_into_cache}, utils::{concurrecy_init, CollisionResult, FilterType}};
 
 //pub static GLOBAL_PBF: OnceCell<PerfectBloomFilter> = OnceCell::new();
 
@@ -44,7 +45,7 @@ impl ShardVector {
             .collect::<Vec<_>>();
 
         let shard_arc = Arc::new(shard_vector);
-        
+
         ShardVector { shard_vector: shard_arc }
     }
 }
@@ -61,8 +62,10 @@ pub struct ShardData {
     pub(crate) hash_family_size: RwLock<u32>,
 
     // IO Cache
-    pub(crate) key_cache: RwLock<Vec<String>>,
+    pub(crate) output_cache: RwLock<Vec<String>>,
 
+    // Rehash
+    pub(crate) active_rehash: RwLock<bool>,
 }
 
 impl Default for ShardData {
@@ -78,14 +81,26 @@ impl ShardData {
         let bloom_length = RwLock::new(BLOOM_STARTING_LENGTH);
         let bloom_length_mult = RwLock::new(BLOOM_STARTING_MULT);
         let hash_family_size = RwLock::new(BLOOM_HASH_FAMILY_SIZE);
-        let key_cache = RwLock::new(Vec::new());
+        let output_cache = RwLock::new(Vec::new());
+        let active_rehash = RwLock::new(false);
         
-        ShardData { filter, key_count, bloom_length, bloom_length_mult, hash_family_size, key_cache }
+        ShardData { filter, key_count, bloom_length, bloom_length_mult, hash_family_size, output_cache, active_rehash }
     }
 }
 
 impl PerfectBloomFilter {
     fn new() -> Self {
+
+        let drain_pool = ThreadPool::new(1);
+
+        drain_pool.execute(move || {
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                let _ = drain_cache(FilterType::Outer);
+                let _ = drain_cache(FilterType::Inner);
+            }
+        });
+
         let outer_filter = ShardVector::default();
         let inner_filter = ShardVector::default();
 
@@ -109,55 +124,30 @@ impl PerfectBloomFilter {
         &*GLOBAL_PBF
     }
 
-    pub fn contains_and_insert(&self, key: &str) -> Result<bool> {
-        let outer = Self::contains_insert(key, &FilterType::Outer)?;
-        let inner = Self::contains_insert(key, &FilterType::Inner)?;
-      
-        Ok(inner & outer)
-    }
-
     pub fn contains(&self, key: &str) -> Result<bool> {
-        let outer = Self::filters_contain(key, &FilterType::Outer)?;
-        let inner = Self::filters_contain(key, &FilterType::Inner)?;
+        let (outer, _outer_shards, _outer_hashes) = Self::existence_check(key, &FilterType::Outer)?;
+        let (inner, _inner_shards, _inner_hashes) = Self::existence_check(key, &FilterType::Inner)?;
 
-        Ok(outer & inner)
+        if !(outer && inner) {
+            Ok(false) 
+        } else {
+            Ok(true)  
+        }
     }
 
     pub fn insert(&self, key: &str) -> Result<()> {
-        Self::filters_insert(key, &FilterType::Outer)?;
-        Self::filters_insert(key, &FilterType::Inner)?;
+        let (_outer, outer_shards, outer_hashes) = Self::existence_check(key, &FilterType::Outer)?;
+        let (_inner, inner_shards, inner_hashes) = Self::existence_check(key, &FilterType::Inner)?;
+
+        bloom_insert(&outer_hashes, &FilterType::Outer)?;
+        bloom_insert(&inner_hashes, &FilterType::Inner)?;
+        insert_into_cache(key, &FilterType::Outer, outer_shards)?;
+        insert_into_cache(key, &FilterType::Inner, inner_shards)?;
 
         Ok(())
     }
 
-    fn contains_insert(key: &str, filter_type: &FilterType) -> Result<bool>{
-        let shards = array_sharding_hash(key, filter_type)?;
-        let shards_hashes = bloom_hash(&shards, key, filter_type)?;
-        let collision_results = bloom_check(&shards_hashes, filter_type)?;
-
-        let exists = match collision_results {
-            CollisionResult::Zero => {
-                bloom_insert(&shards_hashes, filter_type);
-                false
-            },
-            CollisionResult::Partial(_) => {
-                bloom_insert(&shards_hashes, filter_type);
-                false
-            }
-            CollisionResult::Complete(_, _) => {
-                true
-            }
-            CollisionResult::Error => {
-                tracing::warn!("unexpected issue with collision result for key: {key}");
-                return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
-            }
-        };
-        
-        Ok(exists)
-    }
-
-
-    fn filters_contain(key: &str, filter_type: &FilterType) -> Result<bool> {
+    fn existence_check(key: &str, filter_type: &FilterType) -> Result<(bool, Vec<u32>, HashMap<u32, Vec<u64>>)>{
         let shards = array_sharding_hash(key, filter_type)?;
         let shards_hashes = bloom_hash(&shards, key, filter_type)?;
         let collision_results = bloom_check(&shards_hashes, filter_type)?;
@@ -178,30 +168,7 @@ impl PerfectBloomFilter {
             }
         };
         
-        Ok(exists)
-    }
-
-    fn filters_insert(key: &str, filter_type: &FilterType) -> Result<()> {
-        let shards = array_sharding_hash(key, filter_type)?;
-        let shards_hashes = bloom_hash(&shards, key, filter_type)?;
-        let collision_results = bloom_check(&shards_hashes, filter_type)?;
-
-        match collision_results {
-            CollisionResult::Zero => {
-                bloom_insert(&shards_hashes, filter_type);
-            },
-            CollisionResult::Partial(_) => {
-                bloom_insert(&shards_hashes, filter_type);
-            }
-            CollisionResult::Complete(_, _) => {
-            }
-            CollisionResult::Error => {
-                tracing::warn!("unexpected issue with collision result for key: {key}");
-                return Err(anyhow!("Failed to match collision rsult of Outer bloom"))
-            }
-        };
-
-        Ok(())
+        Ok((exists, shards, shards_hashes))
     }
 
 }
@@ -231,7 +198,7 @@ fn lock_shard_state<'a>(shard: u32, filter_type: FilterType) -> Result<(
             let len = GLOBAL_PBF.inner_filter.shard_vector[shard as usize].bloom_length.write().unwrap();
             let len_mult = GLOBAL_PBF.inner_filter.shard_vector[shard as usize].bloom_length_mult.write().unwrap();
             let len_count = GLOBAL_PBF.inner_filter.shard_vector[shard as usize].key_count.write().unwrap();
-            let filter =GLOBAL_PBF.inner_filter.shard_vector[shard as usize].filter.write().unwrap();
+            let filter = GLOBAL_PBF.inner_filter.shard_vector[shard as usize].filter.write().unwrap();
             (len, len_mult, len_count, filter)
         },
     };

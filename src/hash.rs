@@ -103,7 +103,7 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
     Ok(hash_list)
 }
 
-pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) {
+pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<()> {
 
     for (idx, hashes) in shards_hashes {
         match filter_type {
@@ -127,6 +127,8 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &Filter
             }
         }
     }
+
+    Ok(())
 }
 
 pub fn bloom_check(map: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<CollisionResult> {
