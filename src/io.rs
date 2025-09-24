@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fs, io::{self, Write}, sync::{Arc, Mutex}};
 
-use crate::{hash::ARRAY_SHARDS, internals::{ACTIVE_STATE, GLOBAL_PBF}, utils::FilterType};
+use crate::{internals::{GLOBAL_PBF}, utils::FilterType};
 use anyhow::Result;
 use csv::Writer;
 
 
-
+/*
 pub fn insert_into_cache(key: &str, filter_type: &FilterType, shards: &Vec<u32>) -> Result<()> {
     let shard_vec = match filter_type {
         FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
@@ -19,80 +19,34 @@ pub fn insert_into_cache(key: &str, filter_type: &FilterType, shards: &Vec<u32>)
     Ok(())
 }
 
+*/
+
+
+/*
 
 pub fn drain_cache(filter_type: FilterType) -> Result<()> {
-    let (shard_vec, rehash_state, drain_state) = match filter_type {
+    let shard_vec = match filter_type {
         FilterType::Outer => {
-            (&GLOBAL_PBF.outer_filter.shard_vector,
-            &ACTIVE_STATE.outer_rehash_state, 
-            &ACTIVE_STATE.outer_drain_state)
+            &GLOBAL_PBF.outer_filter.shard_vector
         }
         
-        
         FilterType::Inner => {
-            (&GLOBAL_PBF.inner_filter.shard_vector,
-            &ACTIVE_STATE.inner_rehash_state, 
-            &ACTIVE_STATE.inner_drain_state)
+            &GLOBAL_PBF.inner_filter.shard_vector
         }
     };
 
     let mut drain_map: HashMap<u32, Vec<String>> = HashMap::new();
 
     for (idx, shard) in shard_vec.iter().enumerate() {
-        if rehash_state[idx].load(std::sync::atomic::Ordering::SeqCst) {
-            continue;
-        } 
-        else if shard.output_cache.read().unwrap().is_empty() {
-            continue;
-        } else {
-            drain_state[idx].store(true, std::sync::atomic::Ordering::SeqCst);
-            let data = std::mem::take(&mut *shard.output_cache.write().unwrap());
-            drain_map.insert(idx as u32, data);
-        }
+        let data = std::mem::take(&mut *shard.output_cache.write().unwrap());
+        drain_map.insert(idx as u32, data);
+        
     }
 
     write_disk_io_cache(&drain_map, &filter_type)?;
-
-    drain_map.keys().into_iter().for_each(|&shard| 
-        drain_state[shard as usize].store(true, std::sync::atomic::Ordering::SeqCst
-    ));
     
     Ok(())
 }
-
-pub fn force_drain_for_rehash_shard(filter_type: &FilterType, shard_idx: u32) -> Result<()> {
-    let (shard_vec, drain_state) = match filter_type {
-        FilterType::Outer => (
-            &GLOBAL_PBF.outer_filter.shard_vector,
-            &ACTIVE_STATE.outer_drain_state,
-        ),
-        FilterType::Inner => (
-            &GLOBAL_PBF.inner_filter.shard_vector,
-            &ACTIVE_STATE.inner_drain_state,
-        ),
-    };
-
-    let shard = &shard_vec[shard_idx as usize];
-    
-    // Skip if output cache is empty
-    if shard.output_cache.read().unwrap().is_empty() {
-        return Ok(());
-    }
-
-    // Take cache data to drain
-    let data = std::mem::take(&mut *shard.output_cache.write().unwrap());
-
-    // Prepare map to write cache data for this single shard
-    let mut drain_map = HashMap::new();
-    drain_map.insert(shard_idx, data);
-
-    // Write drained data to disk
-    write_disk_io_cache(&drain_map, filter_type)?;
-
-
-    Ok(())
-}
-
 
 pub fn write_disk_io_cache(drain_map: &HashMap<u32, Vec<String>>, filter_type: &FilterType) -> Result<()> {
     let node_type = match filter_type {
@@ -125,6 +79,11 @@ pub fn write_disk_io_cache(drain_map: &HashMap<u32, Vec<String>>, filter_type: &
     Ok(())
 }
 
+*/
+
+
+
+/*
 pub fn dump_metadata() {
     let file_path = "./data/metadata.csv";
      let mut wtr = Writer::from_path(file_path).unwrap();
@@ -146,3 +105,5 @@ pub fn dump_metadata() {
 
     wtr.flush().unwrap();
 }
+ */
+

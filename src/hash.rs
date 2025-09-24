@@ -24,7 +24,6 @@ pub const BLOOM_STARTING_MULT: u32 = 12;
 pub const BLOOM_STARTING_LENGTH: u64 = 1u64 << BLOOM_STARTING_MULT;
 
 pub fn array_sharding_hash(key: &str, filter_type: &FilterType) -> Result<Vec<u32>> {
-
     let mask = ARRAY_SHARDS - 1;
     let hash_seed = match filter_type {
         FilterType::Outer => {
@@ -65,7 +64,7 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
             let mut bitvec_lens: Vec<u64> = vec![];
 
             for shard in shards{
-                let bit_vec_len = GLOBAL_PBF.outer_filter.shard_vector[*shard as usize].bloom_length.read().unwrap();
+                let bit_vec_len = &GLOBAL_PBF.outer_filter.shard_vector[*shard as usize].read().unwrap().bloom_length;
                 bitvec_lens.push(*bit_vec_len);
             }
             (bitvec_lens, [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], BLOOM_HASH_FAMILY_SIZE)
@@ -74,7 +73,7 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
             let mut bitvec_lens: Vec<u64> = vec![];
             
             for shard in shards {
-                let bit_vec_len = GLOBAL_PBF.inner_filter.shard_vector[*shard as usize].bloom_length.read().unwrap();
+                let bit_vec_len = &GLOBAL_PBF.inner_filter.shard_vector[*shard as usize].read().unwrap().bloom_length;
                 bitvec_lens.push(*bit_vec_len);
             }
             (bitvec_lens, [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]], BLOOM_HASH_FAMILY_SIZE)
@@ -110,38 +109,29 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &Filter
     };
 
     for (idx, hashes) in shards_hashes {
-        let mut locked_filter = filter[*idx as usize].filter.write().unwrap();
+        let locked_filter = &mut filter[*idx as usize].write().unwrap();
 
         hashes.iter().for_each(|&bloom_index| {
-            locked_filter.set(bloom_index as usize, true);
+            locked_filter.filter.set(bloom_index as usize, true);
         });
 
-        *filter[*idx as usize].key_count.write().unwrap() += 1;
+        locked_filter.key_count += 1;
     }
-
     Ok(())
 }
 
 pub fn bloom_check(map: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<CollisionResult> {
     let mut collision_map: HashMap<u32, bool> = HashMap::new();
+    let filter = match filter_type {
+        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
+        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
+    };
 
-    match filter_type {
-        FilterType::Outer => {
-            for (&shard, hashes) in map {
-                let locked_pbf = GLOBAL_PBF.outer_filter.shard_vector[shard as usize].filter.read().unwrap();
-                let all_set = hashes.iter().all(|&bloom_index| locked_pbf[bloom_index as usize]);
+    for (&shard, hashes) in map {
+        let locked_pbf = filter[shard as usize].read().unwrap();
+        let all_set = hashes.iter().all(|&bloom_index| locked_pbf.filter[bloom_index as usize]);
 
-                collision_map.insert(shard, all_set);
-            }
-        }
-        FilterType::Inner => {
-            for (&shard, hashes) in map {
-                let locked_pbf = GLOBAL_PBF.inner_filter.shard_vector[shard as usize].filter.read().unwrap();
-                let all_set = hashes.iter().all(|&bloom_index| locked_pbf[bloom_index as usize]);
-
-                collision_map.insert(shard, all_set);
-            }
-        }
+        collision_map.insert(shard, all_set);
     }
 
     Ok(process_collisions(&collision_map)?)
