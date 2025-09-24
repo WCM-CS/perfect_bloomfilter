@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, RwLock, RwLockWriteGuard}, thread, time::Duration};
+use std::{collections::HashMap, ptr::fn_addr_eq, sync::{Arc, RwLock, RwLockWriteGuard}, thread::{self, Builder}, time::Duration};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
@@ -90,13 +90,17 @@ impl ShardData {
 
 impl PerfectBloomFilter {
     fn new() -> Self {
+        let sys_threads = concurrecy_init().unwrap();
+        let rehash_threads = sys_threads - 2;
 
-        let drain_pool = ThreadPool::new(1);
-
-        drain_pool.execute(move || {
+        std::thread::spawn(move || {
             loop {
-                thread::sleep(Duration::from_secs(2));
                 let _ = drain_cache(FilterType::Outer);
+            }
+        });
+
+        std::thread::spawn(move || {
+            loop {
                 let _ = drain_cache(FilterType::Inner);
             }
         });
@@ -104,12 +108,10 @@ impl PerfectBloomFilter {
         let outer_filter = ShardVector::default();
         let inner_filter = ShardVector::default();
 
-
         PerfectBloomFilter {
             outer_filter: outer_filter,
             inner_filter: inner_filter,
         }
-
     }
 
     pub fn system() -> &'static PerfectBloomFilter{
@@ -140,11 +142,29 @@ impl PerfectBloomFilter {
         let (_inner, inner_shards, inner_hashes) = Self::existence_check(key, &FilterType::Inner)?;
 
         bloom_insert(&outer_hashes, &FilterType::Outer)?;
-        bloom_insert(&inner_hashes, &FilterType::Inner)?;
         insert_into_cache(key, &FilterType::Outer, outer_shards)?;
+
+        bloom_insert(&inner_hashes, &FilterType::Inner)?;
         insert_into_cache(key, &FilterType::Inner, inner_shards)?;
 
         Ok(())
+    }
+
+    pub fn contains_and_insert(&self, key: &str) -> Result<bool> {
+        let (outer, outer_shards, outer_hashes) = Self::existence_check(key, &FilterType::Outer)?;
+        let (inner, inner_shards, inner_hashes) = Self::existence_check(key, &FilterType::Inner)?;
+
+        if !(outer && inner) {
+            bloom_insert(&outer_hashes, &FilterType::Outer)?;
+            insert_into_cache(key, &FilterType::Outer, outer_shards)?;
+
+            bloom_insert(&inner_hashes, &FilterType::Inner)?;
+            insert_into_cache(key, &FilterType::Inner, inner_shards)?;
+
+            Ok(false) 
+        } else {
+            Ok(true)  
+        }
     }
 
     fn existence_check(key: &str, filter_type: &FilterType) -> Result<(bool, Vec<u32>, HashMap<u32, Vec<u64>>)>{
@@ -153,15 +173,9 @@ impl PerfectBloomFilter {
         let collision_results = bloom_check(&shards_hashes, filter_type)?;
 
         let exists = match collision_results {
-            CollisionResult::Zero => {
-                false
-            },
-            CollisionResult::Partial(_) => {
-                false
-            }
-            CollisionResult::Complete(_, _) => {
-                true
-            }
+            CollisionResult::Zero => false,
+            CollisionResult::Partial(_) => false,
+            CollisionResult::Complete(_, _) => true,
             CollisionResult::Error => {
                 tracing::warn!("unexpected issue with collision result for key: {key}");
                 return Err(anyhow!("Failed to match collision rsult of Outer bloom"))

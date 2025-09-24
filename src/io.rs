@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::{self, Write}};
+use std::{collections::HashMap, fs, io::{self, Write}, sync::{Arc, Mutex}};
 
 use crate::{hash::ARRAY_SHARDS, internals::GLOBAL_PBF, utils::FilterType};
 use anyhow::Result;
@@ -7,62 +7,40 @@ use csv::Writer;
 
 
 pub fn insert_into_cache(key: &str, filter_type: &FilterType, shards: Vec<u32>) -> Result<()> {
-    match filter_type {
-        FilterType::Outer => {
-            shards.iter().for_each(|shard|{ 
-                GLOBAL_PBF.outer_filter.shard_vector[*shard as usize].output_cache.write().unwrap().push(key.to_string());
-            });
-        },
-        FilterType::Inner => {
-            shards.iter().for_each(|shard|{ 
-                GLOBAL_PBF.inner_filter.shard_vector[*shard as usize].output_cache.write().unwrap().push(key.to_string());
-            });
-        }
-    }
+    let shard_vec = match filter_type {
+        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
+        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
+    };
+
+    shards.iter().for_each(|shard| {
+        shard_vec[*shard as usize].output_cache.write().unwrap().push(key.to_string());
+    });
 
     Ok(())
-
 }
 
 
 pub fn drain_cache(filter_type: FilterType) -> Result<()> {
+    let shard_vec = match filter_type {
+        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
+        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector,
+    };
+
     let mut drain_map: HashMap<u32, Vec<String>> = HashMap::new();
 
-    match filter_type {
-        FilterType::Outer => {
-            for shard in 0..ARRAY_SHARDS {
-                if *GLOBAL_PBF.outer_filter.shard_vector[shard as usize].active_rehash.read().unwrap() {
-                    continue
-                } 
-                else if GLOBAL_PBF.outer_filter.shard_vector[shard as usize].output_cache.read().unwrap().is_empty() {
-                    continue
-                } else {
-                    let data = std::mem::take(&mut *GLOBAL_PBF.outer_filter.shard_vector[shard as usize].output_cache.write().unwrap());
-                    drain_map.insert(shard, data);
-                }
-            }
-
-            write_disk_io_cache(drain_map, filter_type)?;
-        },
-        FilterType::Inner => {
-            for shard in 0..ARRAY_SHARDS {
-                if *GLOBAL_PBF.inner_filter.shard_vector[shard as usize].active_rehash.read().unwrap() {
-                    continue
-                } 
-                else if GLOBAL_PBF.inner_filter.shard_vector[shard as usize].output_cache.read().unwrap().is_empty() {
-                    continue
-                } else {
-                    let data = std::mem::take(&mut *GLOBAL_PBF.inner_filter.shard_vector[shard as usize].output_cache.write().unwrap());
-                    drain_map.insert(shard, data);
-                }
-            }
-
-            write_disk_io_cache(drain_map, filter_type)?;
-        },
+    for (idx, shard) in shard_vec.iter().enumerate() {
+        if *shard.active_rehash.read().unwrap() {
+            continue;
+        } else if shard.output_cache.read().unwrap().is_empty() {
+            continue;
+        } else {
+            let data = std::mem::take(&mut *shard.output_cache.write().unwrap());
+            drain_map.insert(idx as u32, data);
+        }
     }
 
+    write_disk_io_cache(drain_map, filter_type)?;
     
-
     Ok(())
 }
 
@@ -72,7 +50,8 @@ pub fn write_disk_io_cache(drain_map: HashMap<u32, Vec<String>>, filter_type: Fi
         FilterType::Inner => "inner".to_string()
     };
 
-    for (shard, keys) in drain_map {
+
+    for (shard, keys) in drain_map{
         if let Some(parent) = std::path::Path::new("./data/pbf_data/init.txt").parent() {
             fs::create_dir_all(parent)?; // Create directory if it does not exist
         }

@@ -104,28 +104,20 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
 }
 
 pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<()> {
+    let filter = match filter_type {
+        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
+        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
+    };
+
 
     for (idx, hashes) in shards_hashes {
-        match filter_type {
-            FilterType::Outer => {
-                let mut locked_filter = GLOBAL_PBF.outer_filter.shard_vector[*idx as usize].filter.write().unwrap();
-                
-                hashes.iter().for_each(|&bloom_index| {
-                    locked_filter.set(bloom_index as usize, true);
-                });
+        let mut locked_filter = filter[*idx as usize].filter.write().unwrap();
 
-                *GLOBAL_PBF.outer_filter.shard_vector[*idx as usize].key_count.write().unwrap() += 1;
-            },
-            FilterType::Inner => {
-                let mut locked_filter = GLOBAL_PBF.inner_filter.shard_vector[*idx as usize].filter.write().unwrap();
-                
-                hashes.iter().for_each(|&bloom_index| {
-                    locked_filter.set(bloom_index as usize, true);
-                });
+        hashes.iter().for_each(|&bloom_index| {
+            locked_filter.set(bloom_index as usize, true);
+        });
 
-                *GLOBAL_PBF.inner_filter.shard_vector[*idx as usize].key_count.write().unwrap() += 1;
-            }
-        }
+        *filter[*idx as usize].key_count.write().unwrap() += 1;
     }
 
     Ok(())
