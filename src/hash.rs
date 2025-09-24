@@ -1,7 +1,7 @@
-use std::{collections::HashMap, hash};
+use std::{collections::HashMap};
 use anyhow::{Result};
 
-use crate::{internals::{PerfectBloomFilter, GLOBAL_PBF}, utils::{ bitwise_and_u32, bitwise_right_shift, bitwise_xor, jump_hash_partition, process_collisions, CollisionResult, FilterType}};
+use crate::{internals::{ GLOBAL_PBF}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
 
 pub const HASH_SEED_SELECTION: [u32; 6] = [
     0x8badf00d,
@@ -108,7 +108,6 @@ pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &Filter
         FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
         FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
     };
-
 
     for (idx, hashes) in shards_hashes {
         let mut locked_filter = filter[*idx as usize].filter.write().unwrap();

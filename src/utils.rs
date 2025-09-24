@@ -100,7 +100,7 @@ pub fn process_collisions(map: &HashMap<u32, bool>) -> Result<CollisionResult> {
     Ok(collision_result)
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Eq, Hash, PartialEq, Clone)]
 pub enum FilterType {
     Outer,
     Inner,
