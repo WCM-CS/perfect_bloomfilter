@@ -35,7 +35,7 @@ mod tests {
        
         tracing::info!("Creating PerfectBloomFilter instance");
         //et config = Config::
-        let pf = PerfectBloomFilter::system();
+        let pf = PerfectBloomFilter::new();
 
         tracing::info!("PerfectBloomFilter created successfully");
         for i in 0..COUNT {

@@ -1,7 +1,7 @@
-use std::{collections::HashMap};
+use std::{collections::HashMap, sync::RwLockWriteGuard};
 use anyhow::{Result};
 
-use crate::{internals::{ GLOBAL_PBF}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
+use crate::{internals::{ ShardData, GLOBAL_PBF}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
 
 pub const HASH_SEED_SELECTION: [u32; 6] = [
     0x8badf00d,
@@ -24,14 +24,10 @@ pub const BLOOM_STARTING_MULT: u32 = 12;
 pub const BLOOM_STARTING_LENGTH: u64 = 1u64 << BLOOM_STARTING_MULT;
 
 pub fn array_sharding_hash(key: &str, filter_type: &FilterType) -> Result<Vec<u32>> {
-    let mask = ARRAY_SHARDS - 1;
+    let mask = ARRAY_SHARDS - 1; // change this to getting to from metadata
     let hash_seed = match filter_type {
-        FilterType::Outer => {
-            HASH_SEED_SELECTION[0]
-        },
-        FilterType::Inner => {
-           HASH_SEED_SELECTION[1]
-        }
+        FilterType::Outer => HASH_SEED_SELECTION[0],
+        FilterType::Inner => HASH_SEED_SELECTION[1],
     };
 
     let key_slice: &[u8] = key.as_bytes();
@@ -56,40 +52,31 @@ pub fn array_sharding_hash(key: &str, filter_type: &FilterType) -> Result<Vec<u3
 
 
 
-pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result<HashMap<u32, Vec<u64>>> {
-    let mut hash_list = HashMap::new();
-    
-    let (bitvec_lens, hash_seeds, hash_family_size) = match filter_type {
-        FilterType::Outer => {
-            let mut bitvec_lens: Vec<u64> = vec![];
-
-            for shard in shards{
-                let bit_vec_len = &GLOBAL_PBF.outer_filter.shard_vector[*shard as usize].read().unwrap().bloom_length;
-                bitvec_lens.push(*bit_vec_len);
-            }
-            (bitvec_lens, [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], BLOOM_HASH_FAMILY_SIZE)
-        },
-        FilterType::Inner => {
-            let mut bitvec_lens: Vec<u64> = vec![];
-            
-            for shard in shards {
-                let bit_vec_len = &GLOBAL_PBF.inner_filter.shard_vector[*shard as usize].read().unwrap().bloom_length;
-                bitvec_lens.push(*bit_vec_len);
-            }
-            (bitvec_lens, [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]], BLOOM_HASH_FAMILY_SIZE)
-        }
+pub fn bloom_hash(
+    shards: &[u32], 
+    key: &str, 
+    filter_type: &FilterType, 
+    locked_shards: &[RwLockWriteGuard<'_, ShardData>]
+) -> Result<HashMap<u32, Vec<u64>>> {
+    let hash_seeds = match filter_type {
+        FilterType::Outer => [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], 
+        FilterType::Inner => [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]],
     };
 
+    let mut hash_list = HashMap::new();
     let key_slice: &[u8] = key.as_bytes();
     let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[0].into());
     let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[1].into());
 
 
     for (i, shard) in shards.iter().enumerate() {
-        let mut key_hashes = Vec::with_capacity(hash_family_size as usize);
-        for idx in 0..hash_family_size {
+        let hash_family_size = &locked_shards[i].hash_family_size;
+        let bloom_length = &locked_shards[i].bloom_length;
+
+        let mut key_hashes = Vec::with_capacity(*hash_family_size as usize);
+        for idx in 0..*hash_family_size {
             let idx_u128 = idx as u128;
-            let mask = (bitvec_lens.get(i).unwrap() - 1) as u128;
+            let mask = (bloom_length - 1) as u128;
             // Kirsch-Mitzenmacher optimization 
             let index  = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
 
@@ -102,36 +89,38 @@ pub fn bloom_hash(shards: &[u32], key: &str, filter_type: &FilterType) -> Result
     Ok(hash_list)
 }
 
-pub fn bloom_insert(shards_hashes: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<()> {
-    let filter = match filter_type {
-        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
-        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
-    };
+pub fn bloom_insert(
+    shards_hashes: &HashMap<u32, Vec<u64>>, 
+    filter_type: &FilterType, 
+    locked_shards: &mut [RwLockWriteGuard<'_, ShardData>]
+) -> Result<()> {
 
-    for (idx, hashes) in shards_hashes {
-        let locked_filter = &mut filter[*idx as usize].write().unwrap();
+    for (i, (idx, hashes)) in shards_hashes.iter().enumerate() {
+        let locked_shard = &mut locked_shards[i];
 
-        hashes.iter().for_each(|&bloom_index| {
-            locked_filter.filter.set(bloom_index as usize, true);
-        });
-
-        locked_filter.key_count += 1;
+        {
+            let locked_filter = &mut locked_shard.filter;
+            hashes.iter().for_each(|&bloom_index| {
+                locked_filter.set(bloom_index as usize, true);
+            });
+        }
+        
+        locked_shard.key_count += 1;
     }
     Ok(())
 }
 
-pub fn bloom_check(map: &HashMap<u32, Vec<u64>>, filter_type: &FilterType) -> Result<CollisionResult> {
+pub fn bloom_check(
+    map: &HashMap<u32, Vec<u64>>, 
+    filter_type: &FilterType,
+    locked_shards: &[RwLockWriteGuard<'_, ShardData>]
+) -> Result<CollisionResult> {
     let mut collision_map: HashMap<u32, bool> = HashMap::new();
-    let filter = match filter_type {
-        FilterType::Outer => &GLOBAL_PBF.outer_filter.shard_vector,
-        FilterType::Inner => &GLOBAL_PBF.inner_filter.shard_vector
-    };
 
-    for (&shard, hashes) in map {
-        let locked_pbf = filter[shard as usize].read().unwrap();
-        let all_set = hashes.iter().all(|&bloom_index| locked_pbf.filter[bloom_index as usize]);
+    for (i, (shard, hashes)) in map.iter().enumerate() {
 
-        collision_map.insert(shard, all_set);
+        let all_set = hashes.iter().all(|&bloom_index| locked_shards[i].filter[bloom_index as usize]);
+        collision_map.insert(*shard, all_set);
     }
 
     Ok(process_collisions(&collision_map)?)
