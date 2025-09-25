@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::RwLockWriteGuard};
 use anyhow::{Result};
 
-use crate::{internals::{ ShardData, GLOBAL_PBF}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
+use crate::{internals::{ ShardData}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
 
 pub const HASH_SEED_SELECTION: [u32; 6] = [
     0x8badf00d,
@@ -38,8 +38,8 @@ pub fn array_sharding_hash(key: &str, filter_type: &FilterType) -> Result<Vec<u3
 
     let shard_size = mask / 2;
     let xor = high^low;
-
-    let p1 = jump_hash_partition(xor, &(mask + 1))?;
+    let bloom_len = mask + 1;
+    let p1 = jump_hash_partition(xor, bloom_len)?;
     let p2 = (p1 + shard_size) & mask;
 
     debug_assert!(
@@ -91,11 +91,10 @@ pub fn bloom_hash(
 
 pub fn bloom_insert(
     shards_hashes: &HashMap<u32, Vec<u64>>, 
-    filter_type: &FilterType, 
     locked_shards: &mut [RwLockWriteGuard<'_, ShardData>]
 ) -> Result<()> {
 
-    for (i, (idx, hashes)) in shards_hashes.iter().enumerate() {
+    for (i, (_idx, hashes)) in shards_hashes.iter().enumerate() {
         let locked_shard = &mut locked_shards[i];
 
         {
@@ -112,7 +111,6 @@ pub fn bloom_insert(
 
 pub fn bloom_check(
     map: &HashMap<u32, Vec<u64>>, 
-    filter_type: &FilterType,
     locked_shards: &[RwLockWriteGuard<'_, ShardData>]
 ) -> Result<CollisionResult> {
     let mut collision_map: HashMap<u32, bool> = HashMap::new();

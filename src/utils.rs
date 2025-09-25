@@ -34,8 +34,8 @@ pub fn bitwise_and_u64(base: u128, mask: u128) -> u64{
 // JumpConsistentHash function, rust port from the jave implementation
 // Link to the repo: https://github.com/ssedano/jump-consistent-hash/blob/master/src/main/java/com/github/ssedano/hash/JumpConsistentHash.java
 // Original algorithm founded in 2014 by google Lamping & Veach
-pub fn jump_hash_partition(key: u64, buckets: &u32) -> Result<u32> {
-    if *buckets == 0 {
+pub fn jump_hash_partition(key: u64, buckets: u32) -> Result<u32> {
+    if buckets == 0 {
         return Err(anyhow!("Number of buckets must be positive"));
     }
 
@@ -43,7 +43,7 @@ pub fn jump_hash_partition(key: u64, buckets: &u32) -> Result<u32> {
     let mut j: i64 = 0;
     let mut mut_key = key;
 
-    while j < *buckets as i64 {
+    while j < buckets as i64 {
         b = j;
         mut_key = mut_key.wrapping_mul(JUMP_HASH_CONSTANT).wrapping_add(1);
 
