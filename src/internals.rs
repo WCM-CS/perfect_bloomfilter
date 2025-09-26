@@ -1,12 +1,11 @@
-use std::{collections::HashMap, fs::OpenOptions, sync::{Arc, RwLock, RwLockWriteGuard}};
+use std::{sync::{Arc, RwLock, RwLockWriteGuard}, time::Duration};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{Result, anyhow};
-use memmap2::{MmapMut, MmapOptions};
 use once_cell::sync::{OnceCell};
 
 
-use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, ARRAY_SHARDS, BLOOM_HASH_FAMILY_SIZE, BLOOM_STARTING_LENGTH, BLOOM_STARTING_MULT}, utils::{concurrecy_init, CollisionResult, FilterType}};
+use crate::{hash::{array_sharding_hash, bloom_check, bloom_hash, bloom_insert, ARRAY_SHARDS, BLOOM_HASH_FAMILY_SIZE, BLOOM_STARTING_LENGTH, BLOOM_STARTING_MULT}, io::{cache_insert, drain_cache, initialize_global_cache}, utils::{concurrecy_init, CollisionResult, FilterType}};
 
 pub static GLOBAL_PBF: OnceCell<Arc<PerfectBloomFilter>> = OnceCell::new();
 
@@ -18,6 +17,24 @@ pub struct PerfectBloomFilter {
 
 impl PerfectBloomFilter {
     pub fn new() -> Arc<Self> {
+
+        initialize_global_cache();
+
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = drain_cache(&FilterType::Outer);
+            }
+        });
+
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = drain_cache(&FilterType::Inner);
+            }
+        });
+
+
         GLOBAL_PBF.get_or_init(|| {
             Arc::new(PerfectBloomFilter {
                 outer_filter: ShardVector::new(ARRAY_SHARDS, &FilterType::Outer),
@@ -105,12 +122,13 @@ impl ShardVector {
 
         let shards_hashes = bloom_hash(&shards, key, filter_type, &locked_shards)?;
         bloom_insert(&shards_hashes, &mut locked_shards)?;
+        cache_insert(key, &shards, filter_type)?;
 
         Ok(())
     }
 }
 
-fn lock_shards<'a>(
+pub fn lock_shards<'a>(
     shards: &[u32], 
     shard_vec: &'a [RwLock<ShardData>]
 ) -> Vec<RwLockWriteGuard<'a, ShardData>> {

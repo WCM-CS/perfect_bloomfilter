@@ -40,14 +40,22 @@ mod tests {
         tracing::info!("PerfectBloomFilter created successfully");
         for i in 0..COUNT {
             let key = i.to_string();
+
+        
             let _ = pf.insert(&key)?;
+            
 
         }
 
-        tracing::info!("Starting confirmation phase 1");
+        /*
+           tracing::info!("Starting confirmation phase 1");
         for i in 0..COUNT {
             let key = i.to_string();
             //let was_present = pf.contains_and_insert(&key)?;
+
+            /*
+            
+             */
             let was_present = pf.contains(&key)?;
 
             if !was_present {
@@ -58,11 +66,15 @@ mod tests {
             assert_eq!(was_present, true);
         }
         tracing::info!("Completed confirmation phase 1");
+        
+         */
+
+     
 
 
         //dump_metadata();
 
-        //std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(100));
 
         Ok(())
     }

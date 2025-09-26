@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::RwLockWriteGuard};
 use anyhow::{Result};
+use bitvec::vec::BitVec;
 
 use crate::{internals::{ ShardData}, utils::{ jump_hash_partition, process_collisions, CollisionResult, FilterType}};
 
@@ -89,6 +90,29 @@ pub fn bloom_hash(
     Ok(hash_list)
 }
 
+pub fn bloom_rehash(key_slice: &[u8], filter_type: &FilterType, bloom_length: u64, bitvec: &mut BitVec) {
+    let (hash_seeds, hash_family_size) = match filter_type {
+        FilterType::Outer => {
+            ([HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], BLOOM_HASH_FAMILY_SIZE)
+        },
+        FilterType::Inner => {
+            ([HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]], BLOOM_HASH_FAMILY_SIZE)
+        },
+    };
+
+    let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[0].into());
+    let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[1].into());
+
+    for idx in 0..hash_family_size {
+        let idx_u128 = idx as u128;
+        let mask = (bloom_length - 1) as u128;
+        // Kirsch-Mitzenmacher optimization 
+        let index  = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
+
+        bitvec.set(index as usize, true); // insert hash into new filter
+    }
+}
+
 pub fn bloom_insert(
     shards_hashes: &HashMap<u32, Vec<u64>>, 
     locked_shards: &mut [RwLockWriteGuard<'_, ShardData>]
@@ -123,8 +147,6 @@ pub fn bloom_check(
 
     Ok(process_collisions(&collision_map)?)
 }
-
-
 
 
 
