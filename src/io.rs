@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet, VecDeque}, fs::{self, File}, io::{self, BufRead, BufReader, Write}, sync::{Arc, Mutex, RwLock, RwLockWriteGuard}};
 
-use crate::{hash::{bloom_rehash, ARRAY_SHARDS}, internals::{lock_shards,GLOBAL_PBF}, utils::FilterType};
+use crate::{hash::{bloom_rehash, ARRAY_SHARDS}, internals::{lock_shards, ShardData, GLOBAL_PBF}, utils::FilterType};
 use anyhow::Result;
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
@@ -10,19 +10,23 @@ use once_cell::sync::{OnceCell};
 //pub const GIB: usize = 1024 * 1024 * 1024;
 //pub static LMDB_ENV: OnceCell<Arc<Env>> = OnceCell::new();
 
+
+
 pub static GLOBAL_CACHE: OnceCell<Arc<Cache>> = OnceCell::new();
+
 const REHASH_SHARD_BATCH: u32 = 5;
+const REHASH_BITVEC_THRESHOLD: f64 = 19.2;
 
 #[derive(Debug)]
 pub struct Cache {
-    outer_cache: Vec<RwLock<Vec<String>>>,
-    inner_cache: Vec<RwLock<Vec<String>>>,
+    pub(crate) outer_cache: Vec<RwLock<Vec<String>>>,
+    pub(crate) inner_cache: Vec<RwLock<Vec<String>>>,
 
-    outer_queue: Arc<RwLock<VecDeque<u32>>>,
-    inner_queue: Arc<RwLock<VecDeque<u32>>>,
+    pub(crate) outer_queue: Arc<RwLock<VecDeque<u32>>>,
+    pub(crate) inner_queue: Arc<RwLock<VecDeque<u32>>>,
 
-    outer_queue_list: Arc<RwLock<HashSet<u32>>>,
-    inner_queue_list: Arc<RwLock<HashSet<u32>>>,
+    pub(crate) outer_queue_list: Arc<RwLock<HashSet<u32>>>,
+    pub(crate) inner_queue_list: Arc<RwLock<HashSet<u32>>>,
 }
 
 impl Default for Cache {
@@ -148,77 +152,7 @@ fn write_disk_io(drain_map: HashMap<usize, Vec<String>>, filter_type: &FilterTyp
 }
 
 
-fn rehash(filter_type: &FilterType, ) -> Result<()> {
-    let (shards, filter, mut locked_shards) = match filter_type {
-        FilterType::Outer => {
-            let mut rehash_shards = Vec::new();
-            let filter = "outer";
 
-            for _ in 0..REHASH_SHARD_BATCH {
-                if let Some(shard) = GLOBAL_CACHE.get().unwrap().outer_queue.write().unwrap().pop_front() {
-                    rehash_shards.push(shard);
-                }
-            }
-
-            let locked_shards = lock_shards(&rehash_shards, &GLOBAL_PBF.get().unwrap().outer_filter.shard_vector);
-            force_drain(filter_type, &rehash_shards)?;
-
-            (rehash_shards, filter, locked_shards)
-        }
-        FilterType::Inner => {
-            let mut rehash_shards = Vec::new();
-            let filter = "inner";
-            
-            for _ in 0..REHASH_SHARD_BATCH {
-                if let Some(shard) = GLOBAL_CACHE.get().unwrap().outer_queue.write().unwrap().pop_front() {
-                    rehash_shards.push(shard);
-                }
-            }
-
-            let locked_shards = lock_shards(&rehash_shards, &GLOBAL_PBF.get().unwrap().inner_filter.shard_vector);
-            force_drain(filter_type, &rehash_shards)?;
-
-            (rehash_shards, filter, locked_shards)
-        },
-    };
-
-    // make sure the locked shards caches are drained 
-
-
-    
-    for (locked_idx, shard) in shards.iter().enumerate() {
-        let file_name = format!("./data/pbf_data/{}_{}.txt", filter, shard);
-        let file = File::open(file_name)?;
-        let mut reader = BufReader::new(file);
-
-        let shard = &mut locked_shards[locked_idx];
-
-        let bloom_len_mult = shard.bloom_length_mult;
-
-        let new_bloom_len_mult = bloom_len_mult + 1;
-        let new_bloom_len = 1u64 << new_bloom_len_mult;
-
-        let mut new_bloomfilter = bitvec![0; new_bloom_len as usize];
-
-        let mut line = String::new();
-        while reader.read_line(&mut line)? > 0 {
-            let key_slice = line.as_bytes();
-            bloom_rehash(key_slice, filter_type, new_bloom_len, &mut new_bloomfilter); // hashes up the slice & mutates the new filter
-
-        }
-
-        shard.bloom_length = new_bloom_len;
-        shard.bloom_length_mult = new_bloom_len_mult;
-        shard.filter = new_bloomfilter;
-
-    }
-
-    
-
-
-    Ok(())
-
-}
 
 
 

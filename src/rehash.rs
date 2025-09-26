@@ -1,72 +1,116 @@
 
 
-use crate::{hash::{BLOOM_HASH_FAMILY_SIZE, HASH_SEED_SELECTION}, utils::FilterType};
+use std::{fs::File, io::{BufRead, BufReader}, sync::RwLockWriteGuard};
+
+use crate::{hash::{bloom_rehash, BLOOM_HASH_FAMILY_SIZE, HASH_SEED_SELECTION}, internals::{lock_shards, ShardData, GLOBAL_PBF}, io::{force_drain, GLOBAL_CACHE}, utils::FilterType};
 use bitvec::vec::BitVec;
 use bitvec::bitvec;
 use anyhow::{anyhow, Result};
 
+
+const REHASH_SHARD_BATCH: u32 = 5;
 const REHASH_BITVEC_THRESHOLD: f64 = 19.2;
-const REHASH_BATCH_SIZE: u16 = 5;
 
 
 
-
-fn bloom_rehash(key: &str, filter_type: &FilterType, bloom_length: u64, bitvec: &mut BitVec) {
-    let (hash_seeds, hash_family_size) = match filter_type {
+fn rehash(filter_type: &FilterType, ) -> Result<()> {
+    let (shards, filter, mut locked_shards) = match filter_type {
         FilterType::Outer => {
-            ([HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]], BLOOM_HASH_FAMILY_SIZE)
-        },
+            let mut rehash_shards = Vec::new();
+            let filter = "outer";
+
+            for _ in 0..REHASH_SHARD_BATCH {
+                if let Some(shard) = GLOBAL_CACHE.get().unwrap().outer_queue.write().unwrap().pop_front() {
+                    rehash_shards.push(shard);
+                }
+            }
+
+            let locked_shards = lock_shards(&rehash_shards, &GLOBAL_PBF.get().unwrap().outer_filter.shard_vector);
+            force_drain(filter_type, &rehash_shards)?;
+
+            (rehash_shards, filter, locked_shards)
+        }
         FilterType::Inner => {
-            ([HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]], BLOOM_HASH_FAMILY_SIZE)
+            let mut rehash_shards = Vec::new();
+            let filter = "inner";
+            
+            for _ in 0..REHASH_SHARD_BATCH {
+                if let Some(shard) = GLOBAL_CACHE.get().unwrap().outer_queue.write().unwrap().pop_front() {
+                    rehash_shards.push(shard);
+                }
+            }
+
+            let locked_shards = lock_shards(&rehash_shards, &GLOBAL_PBF.get().unwrap().inner_filter.shard_vector);
+            force_drain(filter_type, &rehash_shards)?;
+
+            (rehash_shards, filter, locked_shards)
         },
     };
 
-    let mut key_hashes = Vec::with_capacity(hash_family_size as usize);
+    // make sure the locked shards caches are drained 
+    for (locked_idx, shard) in shards.iter().enumerate() {
+        let file_name = format!("./data/pbf_data/{}_{}.txt", filter, shard);
+        let file = File::open(file_name)?;
+        let mut reader = BufReader::new(file);
 
-    let key_slice: &[u8] = key.as_bytes();
-    let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[0].into());
-    let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[1].into());
+        let shard = &mut locked_shards[locked_idx];
 
-    for idx in 0..hash_family_size {
-        let idx_u128 = idx as u128;
-        let mask = (bloom_length - 1) as u128;
-        // Kirsch-Mitzenmacher optimization 
-        let index  = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
+        let bloom_len_mult = shard.bloom_length_mult;
 
-        key_hashes.push(index as u64)
+        let new_bloom_len_mult = bloom_len_mult + 1;
+        let new_bloom_len = 1u64 << new_bloom_len_mult;
+
+        let mut new_bloomfilter = bitvec![0; new_bloom_len as usize];
+
+        let mut line = String::new();
+        while reader.read_line(&mut line)? > 0 {
+            let key_slice = line.as_bytes();
+            bloom_rehash(key_slice, filter_type, new_bloom_len, &mut new_bloomfilter); // hashes up the slice & mutates the new filter
+
+        }
+
+        shard.bloom_length = new_bloom_len;
+        shard.bloom_length_mult = new_bloom_len_mult;
+        shard.filter = new_bloomfilter;
+
     }
 
-    for hash in key_hashes {
-        bitvec.set(hash as usize, true);
-    }
+    
 
+
+    Ok(())
 
 }
 
 
-/*
-pub fn metadata_computation(filter_type: &FilterType, shard_idx: &Vec<u32>) {
-    let (shard_vec, rehash_queue, rehash_list, active_rehash) = match filter_type {
-        FilterType::Outer => (&GLOBAL_PBF.outer_filter.shard_vector, &REHASH_QUEUE.outer_queue, &REHASH_QUEUE.outer_lookup_list, &ACTIVE_STATE.outer_rehash_state),
-        FilterType::Inner =>  (&GLOBAL_PBF.inner_filter.shard_vector, &REHASH_QUEUE.inner_queue, &REHASH_QUEUE.inner_lookup_list, &ACTIVE_STATE.inner_rehash_state)
+
+pub fn metadata_computation(locked_shards: &[RwLockWriteGuard<'_, ShardData>], shards_idx: &[u32], filter_type: &FilterType) {
+    let (cache, cache_list) = match filter_type {
+        FilterType::Outer => (GLOBAL_CACHE.get().unwrap().outer_queue.clone(), GLOBAL_CACHE.get().unwrap().outer_queue_list.clone()),
+        FilterType::Inner => (GLOBAL_CACHE.get().unwrap().inner_queue.clone(), GLOBAL_CACHE.get().unwrap().inner_queue_list.clone()),
     };
 
-    for shard in shard_idx {
-        let shard_key_count = shard_vec[*shard as usize].key_count.read().unwrap();
-        let shard_bloom_length = shard_vec[*shard as usize].bloom_length.read().unwrap();
+    for (idx, shard) in locked_shards.iter().enumerate() {
+        let bits_per_key = shard.bloom_length as f64 / shard.key_count as f64;
 
-        if (*shard_bloom_length as f64 / *shard_key_count as f64) < REHASH_BITVEC_THRESHOLD {
-            if rehash_list.read().unwrap().contains(&shard){ // this is a linear scan and make not perfrom well overtime maye change this to a hashset
-                continue
-            } else if active_rehash[*shard as usize].load(std::sync::atomic::Ordering::SeqCst) {
-                continue
+        if bits_per_key <= 19.2 {
+            // insert into rehash cache if its not already there
+            if cache_list.read().unwrap().contains(&shards_idx[idx]) {
+                continue // do nothing as this shard does need to rehash but it it alreay in the queue
             } else {
-                rehash_list.write().unwrap().insert(*shard);
-                rehash_queue.write().unwrap().push_back(*shard);
+                // push the shard idx to the queue
+                // shard idx is the shards id vector, indexes to the locked shard in uses lockes shard idx maps to the sahrds idx vector
+               cache_list.write().unwrap().insert(shards_idx[idx]);
+               cache.write().unwrap().push_back(shards_idx[idx]);
+                
             }
+
+
+
+
         }
     }
 
-}
- */
 
+}
+ 
