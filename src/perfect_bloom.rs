@@ -1,9 +1,7 @@
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::{fs, io};
 use std::sync::RwLock; // Locking
-use anyhow::{Result, anyhow}; // Error handling
-
 use bitvec::vec::BitVec; // Bitvec crate
 use bitvec::bitvec; // Bitvec Macro
 
@@ -19,13 +17,12 @@ pub const HASH_SEED_SELECTION: [u32; 6] = [
 pub struct PerfectBloomFilter {
     pub(crate) cartographer: Vec<RwLock<Shard>>,
     pub(crate) inheritor: Vec<RwLock<Shard>>,
-
 }
 
 impl PerfectBloomFilter {
-    pub fn new(shard_vector_len_mult: u32, filter_len_mult: u32, filter_hash_family_size: u32) -> Result<Self> {
+    pub fn new(shard_vector_len_mult: u32, filter_len_mult: u32, filter_hash_family_size: u32) -> Self {
         if let Some(parent) = std::path::Path::new("./data/pbf_data/init.txt").parent() {
-            fs::create_dir_all(parent)?; // Create directory if it does not exist
+            fs::create_dir_all(parent).unwrap(); // Create directory if it does not exist
         }
 
         let shard_vector_len = 1usize << shard_vector_len_mult;
@@ -40,7 +37,7 @@ impl PerfectBloomFilter {
                 1u64 << filter_len_mult,
                 filter_len_mult,
                 filter_hash_family_size,
-            )?));
+            )));
 
             inheritor.push(RwLock::new(Shard::new_inheritor_shard(
                 0,
@@ -48,86 +45,84 @@ impl PerfectBloomFilter {
                 1u64 << filter_len_mult,
                 filter_len_mult,
                 filter_hash_family_size,
-            )?));
+            )));
         }
 
-        Ok(Self {
+        Self {
             cartographer,
             inheritor,
-        })
+        }
     }
 
-    pub fn contains(&self, key: &str) -> Result<bool> {
-        let cart_exists = Self::existence_check(&self, key, &ShardType::Cartographer)?;
-        let inher_exists = Self::existence_check(&self, key, &ShardType::Inheritor)?;
+    pub fn contains(&self, key: &str) -> bool {
+        let key_slice: &[u8] = key.as_bytes();
+        let cart_exists = Self::existence_check(&self, key_slice, &ShardType::Cartographer);
+        let inher_exists = Self::existence_check(&self, key_slice, &ShardType::Inheritor);
 
-       Ok(cart_exists & inher_exists)
+       cart_exists & inher_exists
     }
 
-    pub fn insert(&self, key: &str) -> Result<()> {
-        Self::insert_key(&self, key, &ShardType::Cartographer)?;
-        Self::insert_key(&self, key, &ShardType::Inheritor)?;
+    pub fn insert(&self, key: &str)  {
+        let key_slice: &[u8] = key.as_bytes();
+        Self::insert_key(&self, key_slice, &ShardType::Cartographer);
+        Self::insert_key(&self, key_slice, &ShardType::Inheritor);
 
-        Ok(())
     }
 
-    fn existence_check(&self, key: &str, shard_type: &ShardType) -> Result<bool> {
+    fn existence_check(&self, key: &[u8], shard_type: &ShardType) -> bool {
         let shard_vec = match shard_type {
             ShardType::Cartographer => &self.cartographer,
             ShardType::Inheritor => &self.inheritor,
         };
 
-        let shards = self.array_sharding_hash(key, shard_type)?;
+        let shards = self.array_sharding_hash(key, shard_type);
 
         for shard in shards {
             let shard = &shard_vec[shard].read().unwrap();
-            let hashes = shard.bloom_hash(key)?;
-            let exist = shard.bloom_check(&hashes)?;
+            let hashes = shard.bloom_hash(key);
+            let exist = shard.bloom_check(&hashes);
+
 
             if !exist {
-                return Ok(false);
+                return false;
             }
         };
 
-        Ok(true)
+        true
     }
 
-    fn insert_key(&self, key: &str, shard_type: &ShardType) -> Result<bool> {
+    fn insert_key(&self, key: &[u8], shard_type: &ShardType) -> bool {
         let shard_vec = match shard_type {
             ShardType::Cartographer => &self.cartographer,
             ShardType::Inheritor => &self.inheritor,
         };
 
-        let shards = self.array_sharding_hash(key, shard_type)?;
+        let shards = self.array_sharding_hash(key, shard_type);
 
         for shard in shards {
             let shard = &mut shard_vec[shard].write().unwrap();
-            let hashes = shard.bloom_hash(key)?;
-            shard.bloom_insert(&hashes, key)?;
-            let rehash = shard.rehash_check()?;
-            shard.drain(rehash)?;
+            let hashes = shard.bloom_hash(key);
+            shard.bloom_insert(&hashes, key);
+            let rehash = shard.rehash_check();
+            shard.drain(rehash);
 
-            // rehash process
-            if rehash{
-                shard.rehash_bloom()?;
-            }
+            rehash.then(|| shard.rehash_bloom());
         };
 
-        Ok(true)
+        true
     }
 
 
 
 
 
-    fn array_sharding_hash(&self, key: &str, shard_type: &ShardType) -> Result<Vec<usize>> {
+    fn array_sharding_hash(&self, key: &[u8], shard_type: &ShardType) -> Vec<usize> {
         let (hash_seed, mask) = match shard_type {
             ShardType::Cartographer => (HASH_SEED_SELECTION[0], self.cartographer.len() - 1),
             ShardType::Inheritor => (HASH_SEED_SELECTION[1], self.inheritor.len() - 1),
         };
 
-        let key_slice: &[u8] = key.as_bytes();
-        let hash = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seed as u64);
+        let hash = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seed as u64);
 
         let high = (hash >> 64) as u64;
         let low = hash as u64;
@@ -135,7 +130,7 @@ impl PerfectBloomFilter {
         let shard_size = mask / 2;
         let xor = high^low;
         let bloom_len = mask + 1;
-        let p1 = jump_hash_partition(xor, bloom_len)?;
+        let p1 = jump_hash_partition(xor, bloom_len);
         let p2 = (p1 + shard_size) & mask;
 
         debug_assert!(
@@ -143,7 +138,7 @@ impl PerfectBloomFilter {
             "Partitions must be unique"
         );
 
-        Ok(vec![p1, p2])
+        vec![p1, p2]
     }
 
 
@@ -154,21 +149,14 @@ impl PerfectBloomFilter {
 
 
 pub struct Shard {
-    // Bloomfilter - immutable
     filter: BitVec,
     filter_layer: ShardType,
     shard_id: u32,
-
-    // shard full id lmdb key range: 'filter_layer:shard_id:0..key_count'
-
-    // Metadata - mutable
     key_count: u64,
     bloom_length: u64,
     bloom_length_mult: u32,
     hash_family_size: u32,
-
-    // Cache
-    key_cache: Vec<String>,
+    key_cache: Vec<Vec<u8>>,
     file_path: String,
 }
 
@@ -176,16 +164,15 @@ pub struct Shard {
 impl Shard {
     pub fn bloom_hash(
         &self,
-        key: &str,
-    ) -> Result<Vec<u64>> {
+        key: &[u8],
+    ) -> Vec<u64> {
         let hash_seeds = match self.filter_layer {
             ShardType::Cartographer => [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]],
             ShardType::Inheritor => [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]],
         };
-        let key_slice: &[u8] = key.as_bytes();
 
-        let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[0].into());
-        let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key_slice, hash_seeds[1].into());
+        let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[0].into());
+        let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[1].into());
 
         let hash_family_size = &self.hash_family_size;
         let bloom_length = &self.bloom_length;
@@ -200,84 +187,89 @@ impl Shard {
             hash_list.push(index as u64)
         }
 
-        Ok(hash_list)
+        hash_list
     }
 
-    fn bloom_insert(&mut self, hashes: &Vec<u64>, key: &str) -> Result<()> {
+    fn bloom_insert(&mut self, hashes: &Vec<u64>, key: &[u8]) {
         hashes.iter().for_each(|hash| self.filter.set(*hash as usize, true));
         self.key_count += 1;
-        self.key_cache.push(key.to_string());
+        self.key_cache.push(key.to_vec());
 
-        Ok(())
     }
 
-    fn bloom_check(&self, hashes: &Vec<u64>) -> Result<bool> {
+    fn bloom_check(&self, hashes: &Vec<u64>) -> bool {
         let res = hashes.iter().all(|hash| self.filter[*hash as usize]);
-        Ok(res)
+        res
     }
 
-    fn drain(&mut self, force_drain: bool) -> Result<()>{
+    fn drain(&mut self, force_drain: bool) {
         if self.key_cache.len() >= 50 || force_drain {
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&self.file_path)?;
+                .open(&self.file_path).unwrap();
 
             let mut writer = io::BufWriter::new(file);
             let keys = std::mem::take(&mut self.key_cache);
-            for k in keys {
-                writeln!(writer, "{}", k)?; // Combine key + newline
-            }
 
-            writer.flush()?;
+            for bytes in keys {
+                let len = bytes.len() as u32;
+                let _ = writer.write_all(&len.to_le_bytes());
+                let _ = writer.write_all(&bytes);
+            }
+            
+            let _ = writer.flush();
         }
 
-        Ok(())
 
     }
 
-    fn rehash_check(&self) -> Result<bool> {
+    fn rehash_check(&self) -> bool {
         // 19.2 rehsah constant to start
         if (self.bloom_length as f64 / self.key_count as f64) <= 19.2 {
-            Ok(true)
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
 
-    fn rehash_bloom(&mut self) -> Result<()> {
-        let file = fs::File::open(&self.file_path)?;
-        let reader = BufReader::new(file);
+    fn rehash_bloom(&mut self) {
+        let file = fs::File::open(&self.file_path).unwrap();
+        let mut reader = BufReader::new(file);
 
         let new_bloom_length = 1usize << (self.bloom_length_mult + 1);
-        let new_bloomfilter = bitvec![0; new_bloom_length];
+        let mut new_bloomfilter = bitvec![0; new_bloom_length];
 
-        self.filter = new_bloomfilter;
         self.bloom_length = new_bloom_length as u64;
-        self.bloom_length_mult = self.bloom_length_mult + 1;
+        self.bloom_length_mult += 1;
+        self.key_count = 0;
 
-
-
-        for line in reader.lines() {
-            let key = line?.trim_end().to_string();
-            let hashes = self.bloom_hash(&key)?;
-            for &hash in &hashes {
-                self.filter.set(hash as usize, true);
+        loop {
+            let mut len_bytes = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut len_bytes) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break; 
+                } else {
+                    return 
+                }
             }
+            
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let mut buffer = vec![0u8; len];
+            reader.read_exact(&mut buffer).unwrap();
+
+            let hashes = self.bloom_hash(&buffer);
+            for &hash in &hashes {
+                new_bloomfilter.set(hash as usize, true);
+            }
+
+            self.key_count += 1;
         }
 
+        self.filter = new_bloomfilter;
 
-        Ok(())
     }
-
-
-
-
-
-
-
-
 
     fn new_cartographer_shard(
         key_count: u64,
@@ -285,9 +277,9 @@ impl Shard {
         filter_starting_len: u64,
         filter_starting_len_mult: u32,
         filter_starting_hash_family: u32
-    ) -> Result<Self> {
+    ) -> Self {
 
-        Ok(Self {
+        Self {
             filter: bitvec![0; filter_starting_len as usize],
             key_count,
             bloom_length: filter_starting_len,
@@ -298,7 +290,7 @@ impl Shard {
             key_cache: vec![],
             file_path: format!("./data/pbf_data/{}_{}.txt", ShardType::Cartographer.as_static_str(), shard_id)
 
-        })
+        }
     }
 
     fn new_inheritor_shard(
@@ -307,9 +299,9 @@ impl Shard {
         filter_starting_len: u64,
         filter_starting_len_mult: u32,
         filter_starting_hash_family: u32
-    ) -> Result<Self> {
+    ) -> Self{
 
-        Ok(Self {
+        Self {
             filter: bitvec![0; filter_starting_len as usize],
             key_count,
             bloom_length: filter_starting_len,
@@ -320,7 +312,7 @@ impl Shard {
             key_cache: vec![],
             file_path: format!("./data/pbf_data/{}_{}.txt", ShardType::Inheritor.as_static_str(), shard_id)
 
-        })
+        }
     }
     /*
     fn new_harbinger_shard(
@@ -381,11 +373,7 @@ const JUMP_HASH_SHIFT: i32 = 33;
 const JUMP_HASH_CONSTANT: u64 = 2862933555777941757;
 const JUMP: f64 = (1u64 << 31) as f64;
 
-pub fn jump_hash_partition(key: u64, buckets: usize) -> Result<usize> {
-    if buckets == 0 {
-        return Err(anyhow!("Number of buckets must be positive"));
-    }
-
+pub fn jump_hash_partition(key: u64, buckets: usize) -> usize {
     let mut b: i64 = -1;
     let mut j: i64 = 0;
     let mut mut_key = key;
@@ -400,7 +388,7 @@ pub fn jump_hash_partition(key: u64, buckets: usize) -> Result<usize> {
         j = ((b as f64 + 1.0) * (JUMP / exp)).floor() as i64;
     }
 
-    Ok(b as usize)
+    b as usize
 }
 
 
@@ -408,13 +396,12 @@ pub fn jump_hash_partition(key: u64, buckets: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    use anyhow::Result;
 
     use once_cell::sync::Lazy;
 
     use crate::perfect_bloom::PerfectBloomFilter;
 
-    static COUNT: i32 = 1_000_000;
+    static COUNT: i32 = 2_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         let _ = tracing_subscriber::fmt()
@@ -427,7 +414,7 @@ mod tests {
 
 
     #[test]
-    fn test_insert_and_contains_function() -> Result<()> {
+    fn test_insert_and_contains_function() {
         Lazy::force(&TRACING);
 
         match std::fs::remove_dir_all("./data/pbf_data") {
@@ -444,7 +431,7 @@ mod tests {
         let shard_vector_len_mult = 12;
         let shard_filter_len_milt = 12;
         let hash_family_size = 7;
-        let pf = PerfectBloomFilter::new(shard_vector_len_mult, shard_filter_len_milt, hash_family_size)?;
+        let pf = PerfectBloomFilter::new(shard_vector_len_mult, shard_filter_len_milt, hash_family_size);
 
         tracing::info!("PerfectBloomFilter created successfully");
 
@@ -453,7 +440,7 @@ mod tests {
         for i in 0..COUNT {
             let key = i.to_string();
 
-            let was_present_a = pf.contains(&key)?;
+            let was_present_a = pf.contains(&key);
 
 
             if was_present_a {
@@ -464,10 +451,10 @@ mod tests {
 
             assert_eq!(was_present_a, false);
 
-            let _ = pf.insert(&key)?;
+            let _ = pf.insert(&key);
 
 
-            let was_present_b = pf.contains(&key)?;
+            let was_present_b = pf.contains(&key);
 
             if !was_present_b {
                 tracing::warn!("Fasle negative: {}", key);
@@ -486,7 +473,6 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(100));
 
-        Ok(())
     }
 
 }
