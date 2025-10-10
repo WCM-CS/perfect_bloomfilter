@@ -18,6 +18,12 @@ pub struct PerfectBloomFilter {
     temp_dir: TempDir
 }
 
+impl Default for PerfectBloomFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PerfectBloomFilter {
     pub fn new() -> Self {
         let config = BloomFilterConfig::default();
@@ -41,15 +47,15 @@ impl PerfectBloomFilter {
     } 
     
     pub fn contains(&self, key: &[u8]) -> bool {
-        let cart_exists = Self::existence_check(&self, key, &ShardType::Cartographer);
-        let inher_exists = Self::existence_check(&self, key, &ShardType::Inheritor);
+        let cart_exists = Self::existence_check(self, key, &ShardType::Cartographer);
+        let inher_exists = Self::existence_check(self, key, &ShardType::Inheritor);
 
         cart_exists & inher_exists
     }
 
     pub fn insert(&self, key: &[u8]) {
-        Self::insert_key(&self, &key, &ShardType::Cartographer);
-        Self::insert_key(&self, &key, &ShardType::Inheritor);
+        Self::insert_key(self, key, &ShardType::Cartographer);
+        Self::insert_key(self, key, &ShardType::Inheritor);
     }
 
     fn existence_check(&self, key: &[u8], shard_type: &ShardType) -> bool {
@@ -192,8 +198,8 @@ impl Shard {
         let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[0]);
         let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[1]);
 
-        let mut hash_list = Vec::with_capacity(*&self.hash_family_size);
-        for idx in 0..*&self.hash_family_size {
+        let mut hash_list = Vec::with_capacity(self.hash_family_size);
+        for idx in 0..self.hash_family_size {
             let idx_u128 = idx as u128;
             let mask = (&self.bloom_length - 1) as u128;
 
@@ -206,15 +212,14 @@ impl Shard {
         hash_list
     }
 
-    fn bloom_insert(&mut self, hashes: &Vec<usize>, key: &[u8]) {
+    fn bloom_insert(&mut self, hashes: &[usize], key: &[u8]) {
         hashes.iter().for_each(|hash| self.filter.set(*hash, true));
         self.key_count += 1;
         self.key_cache.push(key.to_vec());
     }
 
-    fn bloom_check(&self, hashes: &Vec<usize>) -> bool {
-        let res = hashes.iter().all(|hash| self.filter[*hash]);
-        res
+    fn bloom_check(&self, hashes: &[usize]) -> bool {
+        hashes.iter().all(|hash| self.filter[*hash])
     }
 
     fn drain(&mut self, force_drain: bool) {
@@ -239,11 +244,7 @@ impl Shard {
     }
 
     fn rehash_check(&self) -> bool {
-        if (self.bloom_length as f64 / self.key_count as f64) <= *REHASH_THRESHOLD.get().unwrap() {
-            true
-        } else {
-            false
-        }
+        (self.bloom_length as f64 / self.key_count as f64) <= *REHASH_THRESHOLD.get().unwrap()
     }
 
     fn expected_n(new_m: usize, bits_per_key_threshold: f64) -> usize {
@@ -300,7 +301,7 @@ impl Shard {
             key_count,
             bloom_length: filter_starting_len,
             bloom_length_mult: filter_starting_len_mult,
-            hash_family_size: hash_family_size,
+            hash_family_size,
             filter_layer: ShardType::Cartographer,
             key_cache: vec![],
             storage_path,
@@ -321,7 +322,7 @@ impl Shard {
             key_count,
             bloom_length: filter_starting_len,
             bloom_length_mult: filter_starting_len_mult,
-            hash_family_size: hash_family_size,
+            hash_family_size,
             filter_layer: ShardType::Inheritor,
             key_cache: vec![],
             storage_path,
