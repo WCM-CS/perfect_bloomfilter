@@ -47,10 +47,15 @@ impl PerfectBloomFilter {
     } 
     
     pub fn contains(&self, key: &[u8]) -> bool {
-        let cart_exists = Self::existence_check(self, key, &ShardType::Cartographer);
-        let inher_exists = Self::existence_check(self, key, &ShardType::Inheritor);
+        if !Self::existence_check(self, key, &ShardType::Cartographer) {
+            return false;
+        }
+        
+        if !Self::existence_check(self, key, &ShardType::Inheritor) {
+            return false;
+        }
 
-        cart_exists & inher_exists
+        true
     }
 
     pub fn insert(&self, key: &[u8]) {
