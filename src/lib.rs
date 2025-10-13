@@ -2,10 +2,10 @@ use bitvec::bitvec;
 use bitvec::vec::BitVec;
 use once_cell::sync::OnceCell;
 use std::fs;
+use std::hash::Hash;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::hash::Hash;
 use tempfile::TempDir;
 
 static REHASH_THRESHOLD: OnceCell<f64> = OnceCell::new();
@@ -15,7 +15,7 @@ pub struct PerfectBloomFilter {
     pub(crate) cartographer: Vec<RwLock<Shard>>,
     pub(crate) inheritor: Vec<RwLock<Shard>>,
     #[allow(dead_code)]
-    temp_dir: TempDir
+    temp_dir_handle: TempDir,
 }
 
 impl Default for PerfectBloomFilter {
@@ -27,30 +27,18 @@ impl Default for PerfectBloomFilter {
 impl PerfectBloomFilter {
     pub fn new() -> Self {
         let config = BloomFilterConfig::default();
-        let (cartographer, inheritor, temp_dir) = Self::pbf_init(config);
-
-        Self {
-            cartographer,
-            inheritor,
-            temp_dir
-        }
+        Self::pbf_init(config)
     }
 
     pub fn new_with_config(config: BloomFilterConfig) -> Self {
-        let (cartographer, inheritor, temp_dir) = Self::pbf_init(config);
+        Self::pbf_init(config)
+    }
 
-        Self {
-            cartographer,
-            inheritor,
-            temp_dir
-        }
-    } 
-    
     pub fn contains(&self, key: &[u8]) -> bool {
         if !Self::existence_check(self, key, &ShardType::Cartographer) {
             return false;
         }
-        
+
         if !Self::existence_check(self, key, &ShardType::Inheritor) {
             return false;
         }
@@ -121,36 +109,36 @@ impl PerfectBloomFilter {
         let low = hash as u64;
 
         let p1 = jump_hash_partition(high ^ low, mask + 1);
-        let p2 = (p1 + (mask/2)) & mask;
+        let p2 = (p1 + (mask / 2)) & mask;
 
         debug_assert!(p1 != p2, "Partitions must be unique");
 
         vec![p1, p2]
     }
 
-    fn pbf_init(config: BloomFilterConfig) -> (Vec<RwLock<Shard>>, Vec<RwLock<Shard>>, TempDir) {
+    fn pbf_init(config: BloomFilterConfig) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
 
         let shard_vector_len_mult = match config.throughput() {
-            Throughput::Low => 11, // 2048
+            Throughput::Low => 11,    // 2048
             Throughput::Medium => 12, // 4096
-            Throughput::High => 13, // 8192
+            Throughput::High => 13,   // 8192
         };
 
         let filter_len_mult = match config.initial_capacity() {
             Capacity::Low => 11,
             Capacity::Medium => 12,
             Capacity::High => 13,
-            Capacity::VeryHigh => 15
+            Capacity::VeryHigh => 15,
         };
-        
+
         let threshold = match config.accuracy() {
-            Accuracy::Low => 12.0, 
+            Accuracy::Low => 12.0,
             Accuracy::Medium => 15.0,
             Accuracy::High => 19.0,
         };
-         
+
         REHASH_THRESHOLD.set(threshold).ok();
         REHASH_SWITCH.set(config.rehash()).ok();
 
@@ -160,8 +148,16 @@ impl PerfectBloomFilter {
         let mut inheritor = Vec::with_capacity(shard_vector_len);
 
         for shard_id in 0..shard_vector_len {
-            let carto_path = base_path.join(format!("{}_{}.tmp", ShardType::Cartographer.as_static_str(), shard_id));
-            let inheritor_path= base_path.join(format!("{}_{}.tmp", ShardType::Inheritor.as_static_str(), shard_id));
+            let carto_path = base_path.join(format!(
+                "{}_{}.tmp",
+                ShardType::Cartographer.as_static_str(),
+                shard_id
+            ));
+            let inheritor_path = base_path.join(format!(
+                "{}_{}.tmp",
+                ShardType::Inheritor.as_static_str(),
+                shard_id
+            ));
 
             cartographer.push(RwLock::new(Shard::new_cartographer_shard(
                 0,
@@ -177,8 +173,12 @@ impl PerfectBloomFilter {
                 inheritor_path,
             )));
         }
-        
-        (cartographer, inheritor, temp_dir)
+
+        Self {
+            cartographer,
+            inheritor,
+            temp_dir_handle: temp_dir,
+        }
     }
 }
 
@@ -209,7 +209,7 @@ impl Shard {
             let mask = (&self.bloom_length - 1) as u128;
 
             // Kirsch-Mitzenmacher optimization
-            let index = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask; 
+            let index = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
 
             hash_list.push(index as usize)
         }
@@ -237,13 +237,13 @@ impl Shard {
 
             let mut writer = BufWriter::new(file);
             let keys = std::mem::take(&mut self.key_cache);
-          
+
             for bytes in keys {
                 let len = bytes.len() as u32;
                 writer.write_all(&len.to_be_bytes()).ok();
                 writer.write_all(&bytes).ok();
             }
-            
+
             writer.flush().ok();
         }
     }
@@ -274,14 +274,14 @@ impl Shard {
         self.hash_family_size = new_k;
 
         let mut len_bytes = [0u8; 4];
-        let mut key_buf = Vec::with_capacity(1024); 
+        let mut key_buf = Vec::with_capacity(1024);
 
         while reader.read_exact(&mut len_bytes).is_ok() {
             let len = u32::from_be_bytes(len_bytes) as usize;
             if key_buf.len() < len {
                 key_buf.resize(len, 0);
             }
-      
+
             reader.read_exact(&mut key_buf[..len]).unwrap();
             let hashes = self.bloom_hash(&key_buf[..len]);
             for hash in hashes {
@@ -380,17 +380,16 @@ pub const HASH_SEED_SELECTION: [u64; 6] = [
     0x8badf00d, 0xdeadbabe, 0xabad1dea, 0xdeadbeef, 0xcafebabe, 0xfeedface,
 ];
 
-
 #[derive(Debug)]
 pub struct BloomFilterConfig {
-    pub rehash: Option<bool>, // True by default
-    pub throughput: Option<Throughput>, // 12 
-    pub accuracy: Option<Accuracy>, // 15.0
+    pub rehash: Option<bool>,           // True by default
+    pub throughput: Option<Throughput>, // 12
+    pub accuracy: Option<Accuracy>,     // 15.0
     pub initial_capacity: Option<Capacity>, // 12
-    // NEW FEATURES ~ TO_DO()!!
-    // pub cascade_tiers: Option<Tiers> Options: 1, 2, 3
-    // pub persistence: Option<bool>
-    // pub file_path: Option<String/PathBuf>  needed for persistence
+                                        // NEW FEATURES ~ TO_DO()!!
+                                        // pub cascade_tiers: Option<Tiers> Options: 1, 2, 3
+                                        // pub persistence: Option<bool>
+                                        // pub file_path: Option<String/PathBuf>  needed for persistence
 }
 
 // Shard count
@@ -415,7 +414,7 @@ pub enum Capacity {
     Low,
     Medium,
     High,
-    VeryHigh
+    VeryHigh,
 }
 
 impl Default for BloomFilterConfig {
@@ -424,7 +423,7 @@ impl Default for BloomFilterConfig {
             rehash: Some(true),
             throughput: Some(Throughput::Medium),
             accuracy: Some(Accuracy::Medium),
-            initial_capacity: Some(Capacity::Medium)
+            initial_capacity: Some(Capacity::Medium),
         }
     }
 }
@@ -438,7 +437,7 @@ impl BloomFilterConfig {
         self.rehash = Some(rehash);
         self
     }
-    
+
     pub fn with_throughput(mut self, volume: Throughput) -> Self {
         self.throughput = Some(volume);
         self
@@ -475,11 +474,11 @@ impl BloomFilterConfig {
 mod tests {
     use std::{io::Read, time::Duration};
 
+    use bincode;
     use bincode::config::Config;
     use once_cell::sync::Lazy;
+    use serde::Deserialize;
     use serde::Serialize;
-    use serde::{Deserialize};
-    use bincode;
 
     use crate::{Accuracy, BloomFilterConfig, Capacity, PerfectBloomFilter, Throughput};
 
@@ -487,8 +486,7 @@ mod tests {
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .try_init().ok();
+            .with_thread_names(true).init();
     });
 
     #[derive(Hash, Serialize, Deserialize, Debug)]
@@ -521,7 +519,7 @@ mod tests {
 
         tracing::info!("Contains & insert & contains check");
         for i in 0..COUNT {
-            let s = Tester{
+            let s = Tester {
                 name: format!("Hello_{}", i),
                 age: i as u32,
             };
@@ -539,7 +537,7 @@ mod tests {
             assert_eq!(was_present_a, false);
             pf.insert(&key_bytes);
             let was_present_b = pf.contains(&key_bytes);
-   
+
             if !was_present_b {
                 tracing::warn!("Fasle negative: {:?}", key_str);
             }
