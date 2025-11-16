@@ -5,6 +5,7 @@ edition = "2024"
 
 
 [dependencies]
+anyhow = "1.0.100"
 bincode = { version = "2", features = ["serde"] }
 bitvec = "1.0.1"
 once_cell = "1.21.3"

@@ -4,9 +4,10 @@ use once_cell::sync::OnceCell;
 use std::fs;
 use std::hash::Hash;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{PathBuf};
 use std::sync::RwLock;
 use tempfile::TempDir;
+use anyhow::anyhow;
 
 static REHASH_THRESHOLD: OnceCell<f64> = OnceCell::new();
 static REHASH_SWITCH: OnceCell<bool> = OnceCell::new();
@@ -46,9 +47,18 @@ impl PerfectBloomFilter {
         true
     }
 
-    pub fn insert(&self, key: &[u8]) {
-        Self::insert_key(self, key, &ShardType::Cartographer);
-        Self::insert_key(self, key, &ShardType::Inheritor);
+    pub fn insert(&self, key: &[u8]) -> anyhow::Result<()> {
+        let c_res = Self::insert_key(self, key, &ShardType::Cartographer)
+            .map_err(|e| tracing::warn!("Vec {} - Insert Err: {}", ShardType::Cartographer.as_static_str(), e));
+
+        let i_res = Self::insert_key(self, key, &ShardType::Inheritor)
+            .map_err(|e| tracing::warn!("Vec {} - Insert Err: {}", ShardType::Inheritor.as_static_str(), e));
+
+        if c_res.is_err() || i_res.is_err() {
+            return Err(anyhow!("Insertion Failed"))
+        }
+
+        return Ok(())
     }
 
     fn existence_check(&self, key: &[u8], shard_type: &ShardType) -> bool {
@@ -72,7 +82,7 @@ impl PerfectBloomFilter {
         true
     }
 
-    fn insert_key(&self, key: &[u8], shard_type: &ShardType) -> bool {
+    fn insert_key(&self, key: &[u8], shard_type: &ShardType) -> anyhow::Result<bool> {
         let shard_vec = match shard_type {
             ShardType::Cartographer => &self.cartographer,
             ShardType::Inheritor => &self.inheritor,
@@ -87,14 +97,14 @@ impl PerfectBloomFilter {
             let rehash = shard.rehash_check();
             shard.drain(rehash);
 
-            rehash.then(|| {
+            if rehash {
                 if *REHASH_SWITCH.get().unwrap() {
-                    shard.rehash_bloom()
+                    shard.rehash_bloom().map_err(|e| anyhow!("Error: {}", e))?;
                 }
-            });
+            }
         }
 
-        true
+        Ok(true)
     }
 
     fn array_sharding_hash(&self, key: &[u8], shard_type: &ShardType) -> Vec<usize> {
@@ -260,7 +270,7 @@ impl Shard {
         ((m as f64 / n as f64) * std::f64::consts::LN_2).round() as usize
     }
 
-    fn rehash_bloom(&mut self) {
+    fn rehash_bloom(&mut self) -> anyhow::Result<()>{
         let file = fs::File::open(&self.storage_path).unwrap();
         let mut reader = BufReader::new(file);
 
@@ -275,14 +285,23 @@ impl Shard {
 
         let mut len_bytes = [0u8; 4];
         let mut key_buf = Vec::with_capacity(1024);
+        const MAX_KEY_SIZE: usize = 1 << 20;
 
         while reader.read_exact(&mut len_bytes).is_ok() {
             let len = u32::from_be_bytes(len_bytes) as usize;
+            if len > MAX_KEY_SIZE {
+                return Err(anyhow!("Potentially corrupted file: key len {}", len));
+            }
+
             if key_buf.len() < len {
                 key_buf.resize(len, 0);
             }
 
-            reader.read_exact(&mut key_buf[..len]).unwrap();
+            if reader.read_exact(&mut key_buf[..len]).is_err() {
+                return Err(anyhow!("Corrupted entry: Unexpected EOF"));
+            }
+
+            
             let hashes = self.bloom_hash(&key_buf[..len]);
             for hash in hashes {
                 new_bloomfilter.set(hash, true);
@@ -290,6 +309,8 @@ impl Shard {
         }
 
         self.filter = new_bloomfilter;
+
+        Ok(())
     }
 
     fn new_cartographer_shard(
@@ -482,11 +503,13 @@ mod tests {
 
     use crate::{Accuracy, BloomFilterConfig, Capacity, PerfectBloomFilter, Throughput};
 
-    static COUNT: i32 = 2_000_000;
+    static COUNT: i32 = 4_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         tracing_subscriber::fmt()
-            .with_thread_names(true).init();
+            .with_max_level(tracing::Level::INFO)
+            .with_thread_names(true)
+            .init();
     });
 
     #[derive(Hash, Serialize, Deserialize, Debug)]
@@ -519,13 +542,17 @@ mod tests {
 
         tracing::info!("Contains & insert & contains check");
         for i in 0..COUNT {
-            let s = Tester {
+
+            /*
+             let s = Tester {
                 name: format!("Hello_{}", i),
                 age: i as u32,
             };
+             */
+           
 
-            let hash_of_s = bincode::serde::encode_to_vec(s, b_c).unwrap();
-            let g = i.to_be_bytes();
+            //let hash_of_s = bincode::serde::encode_to_vec(s, b_c).unwrap();
+            //let g = i.to_be_bytes();
             let key_str = i.to_string();
             let key_bytes = key_str.as_bytes();
             let was_present_a = pf.contains(&key_bytes);
@@ -535,7 +562,10 @@ mod tests {
             }
 
             assert_eq!(was_present_a, false);
-            pf.insert(&key_bytes);
+
+            let _ = pf.insert(&key_bytes).map_err(|e| {
+                tracing::info!("Failed to insert key: {}, Error: {}", key_str, e)
+            });
             let was_present_b = pf.contains(&key_bytes);
 
             if !was_present_b {
