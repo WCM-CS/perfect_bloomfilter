@@ -1,0 +1,396 @@
+use std::path::PathBuf;
+use bitvec::{bitvec, vec::BitVec};
+use once_cell::sync::OnceCell;
+use tempfile::TempDir;
+use anyhow::{anyhow, Result};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, sync::RwLock};
+
+use crate::perfect_bloomfilter::config::*;
+
+static REHASH_THRESHOLD: OnceCell<f64> = OnceCell::new();
+static REHASH_SWITCH: OnceCell<bool> = OnceCell::new();
+
+pub struct PerfectBloomFilter {
+    pub(crate) cartographer: Vec<RwLock<Shard>>,
+    pub(crate) inheritor: Vec<RwLock<Shard>>,
+    #[allow(dead_code)]
+    temp_dir_handle: TempDir,
+}
+
+impl Default for PerfectBloomFilter{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PerfectBloomFilter {
+    pub fn new() -> Self {
+        let config = BloomFilterConfig::default();
+        Self::pbf_init(config)
+    }
+
+    pub fn new_with_config(config: BloomFilterConfig) -> Self {
+        Self::pbf_init(config)
+    }
+
+    pub async fn contains(&self, key: &[u8]) -> bool {
+        if !Self::existence_check(self, key, &ShardType::Cartographer).await {
+            return false;
+        }
+
+        if !Self::existence_check(self, key, &ShardType::Inheritor).await {
+            return false;
+        }
+
+        true
+    }
+
+    pub async fn insert(&self, key: &[u8]) -> Result<()> {
+        Self::insert_key(self, key, &ShardType::Cartographer).await?;
+        Self::insert_key(self, key, &ShardType::Inheritor).await?;
+
+        return Ok(())
+    }
+
+    async fn existence_check(&self, key: &[u8], shard_type: &ShardType) -> bool {
+        let shard_vec = match shard_type {
+            ShardType::Cartographer => &self.cartographer,
+            ShardType::Inheritor => &self.inheritor,
+        };
+
+        let shards = self.array_sharding_hash(key, shard_type);
+
+        for shard in shards {
+            let shard = &shard_vec[shard].read().await;
+            let hashes = shard.bloom_hash(key);
+            let exist = shard.bloom_check(&hashes);
+
+            if !exist {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    async fn insert_key(&self, key: &[u8], shard_type: &ShardType) -> anyhow::Result<bool> {
+        let shard_vec = match shard_type {
+            ShardType::Cartographer => &self.cartographer,
+            ShardType::Inheritor => &self.inheritor,
+        };
+
+        let shards = self.array_sharding_hash(key, shard_type);
+
+        for shard in shards {
+            let shard = &mut shard_vec[shard].write().await;
+            let hashes = shard.bloom_hash(key);
+            shard.bloom_insert(&hashes, key);
+            let rehash = shard.rehash_check();
+            shard.drain(rehash).await?;
+
+            if rehash {
+                if *REHASH_SWITCH.get().unwrap() {
+                    shard.rehash_bloom().await?;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn array_sharding_hash(&self, key: &[u8], shard_type: &ShardType) -> Vec<usize> {
+        let (hash_seed, mask) = match shard_type {
+            ShardType::Cartographer => (HASH_SEED_SELECTION[0], self.cartographer.len() - 1),
+            ShardType::Inheritor => (HASH_SEED_SELECTION[1], self.inheritor.len() - 1),
+        };
+
+        let hash = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seed);
+
+        let high = (hash >> 64) as u64;
+        let low = hash as u64;
+
+        let p1 = jump_hash_partition(high ^ low, mask + 1);
+        let p2 = (p1 + (mask / 2)) & mask;
+
+        debug_assert!(p1 != p2, "Partitions must be unique");
+
+        vec![p1, p2]
+    }
+
+    fn pbf_init(config: BloomFilterConfig) -> Self {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        let shard_vector_len_mult = match config.throughput() {
+            Throughput::Low => 11,    // 2048
+            Throughput::Medium => 12, // 4096
+            Throughput::High => 13,   // 8192
+        };
+
+        let filter_len_mult = match config.initial_capacity() {
+            Capacity::Low => 11,
+            Capacity::Medium => 12,
+            Capacity::High => 13,
+            Capacity::VeryHigh => 15,
+        };
+
+        let threshold = match config.accuracy() {
+            Accuracy::Low => 12.0,
+            Accuracy::Medium => 15.0,
+            Accuracy::High => 19.0,
+        };
+
+        REHASH_THRESHOLD.set(threshold).ok();
+        REHASH_SWITCH.set(config.rehash()).ok();
+
+        let shard_vector_len = 1usize << shard_vector_len_mult;
+
+        let mut cartographer = Vec::with_capacity(shard_vector_len);
+        let mut inheritor = Vec::with_capacity(shard_vector_len);
+
+        for shard_id in 0..shard_vector_len {
+            let carto_path = base_path.join(format!(
+                "{}_{}.tmp",
+                ShardType::Cartographer.as_static_str(),
+                shard_id
+            ));
+            let inheritor_path = base_path.join(format!(
+                "{}_{}.tmp",
+                ShardType::Inheritor.as_static_str(),
+                shard_id
+            ));
+
+            cartographer.push(RwLock::new(Shard::new_cartographer_shard(
+                0,
+                1usize << filter_len_mult,
+                filter_len_mult,
+                carto_path,
+            )));
+
+            inheritor.push(RwLock::new(Shard::new_inheritor_shard(
+                0,
+                1usize << filter_len_mult,
+                filter_len_mult,
+                inheritor_path,
+            )));
+        }
+
+        Self {
+            cartographer,
+            inheritor,
+            temp_dir_handle: temp_dir,
+        }
+    }
+}
+
+pub struct Shard {
+    filter: BitVec,
+    filter_layer: ShardType,
+    key_count: u64,
+    bloom_length: usize,
+    bloom_length_mult: usize,
+    hash_family_size: usize,
+    key_cache: Vec<Vec<u8>>,
+    storage_path: PathBuf,
+}
+
+impl Shard {
+    pub fn bloom_hash(&self, key: &[u8]) -> Vec<usize> {
+        let hash_seeds = match self.filter_layer {
+            ShardType::Cartographer => [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]],
+            ShardType::Inheritor => [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]],
+        };
+
+        let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[0]);
+        let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[1]);
+
+        let mut hash_list = Vec::with_capacity(self.hash_family_size);
+        for idx in 0..self.hash_family_size {
+            let idx_u128 = idx as u128;
+            let mask = (&self.bloom_length - 1) as u128;
+
+            // Kirsch-Mitzenmacher optimization
+            let index = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
+
+            hash_list.push(index as usize)
+        }
+
+        hash_list
+    }
+
+    fn bloom_insert(&mut self, hashes: &[usize], key: &[u8]) {
+        hashes.iter().for_each(|hash| self.filter.set(*hash, true));
+        self.key_count += 1;
+        self.key_cache.push(key.to_vec());
+    }
+
+    fn bloom_check(&self, hashes: &[usize]) -> bool {
+        hashes.iter().all(|hash| self.filter[*hash])
+    }
+
+    async fn drain(&mut self, force_drain: bool) -> Result<()> {
+        if self.key_cache.len() >= 50 || force_drain {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.storage_path)
+                .await?;
+
+            let mut writer = BufWriter::new(file);
+            let keys = std::mem::take(&mut self.key_cache);
+
+            for bytes in keys {
+                let len = bytes.len() as u32;
+                writer.write_all(&len.to_be_bytes()).await?;
+                writer.write_all(&bytes).await?;
+            }
+
+            writer.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    fn rehash_check(&self) -> bool {
+        (self.bloom_length as f64 / self.key_count as f64) <= *REHASH_THRESHOLD.get().unwrap()
+    }
+
+    fn expected_n(new_m: usize, bits_per_key_threshold: f64) -> usize {
+        (new_m as f64 / bits_per_key_threshold).floor() as usize
+    }
+
+    fn optimal_k(m: usize, n: usize) -> usize {
+        ((m as f64 / n as f64) * std::f64::consts::LN_2).round() as usize
+    }
+
+    async fn rehash_bloom(&mut self) -> Result<()>{
+        let file = fs::File::open(&self.storage_path).await?;
+        let mut reader = BufReader::new(file);
+
+        let new_bloom_length = 1usize << (self.bloom_length_mult + 1);
+        let mut new_bloomfilter = bitvec![0; new_bloom_length];
+        let expected_n = Self::expected_n(new_bloom_length, *REHASH_THRESHOLD.get().unwrap());
+        let new_k = Self::optimal_k(new_bloom_length, expected_n);
+
+        self.bloom_length = new_bloom_length;
+        self.bloom_length_mult += 1;
+        self.hash_family_size = new_k;
+
+        let mut len_bytes = [0u8; 4];
+        let mut key_buf = Vec::with_capacity(1024);
+        const MAX_KEY_SIZE: usize = 1 << 20;
+
+        while reader.read_exact(&mut len_bytes).await.is_ok() {
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            if len > MAX_KEY_SIZE {
+                return Err(anyhow!("Potentially corrupted file: key len {}", len));
+            }
+
+            if key_buf.len() < len {
+                key_buf.resize(len, 0);
+            }
+
+            if reader.read_exact(&mut key_buf[..len]).await.is_err() {
+                return Err(anyhow!("Corrupted entry: Unexpected EOF"));
+            }
+
+            
+            let hashes = self.bloom_hash(&key_buf[..len]);
+            for hash in hashes {
+                new_bloomfilter.set(hash, true);
+            }
+        }
+
+        self.filter = new_bloomfilter;
+
+        Ok(())
+    }
+
+    fn new_cartographer_shard(
+        key_count: u64,
+        filter_starting_len: usize,
+        filter_starting_len_mult: usize,
+        storage_path: PathBuf,
+    ) -> Self {
+        let n = Self::expected_n(filter_starting_len, *REHASH_THRESHOLD.get().unwrap());
+        let hash_family_size = Self::optimal_k(filter_starting_len, n);
+
+        Self {
+            filter: bitvec![0; filter_starting_len],
+            key_count,
+            bloom_length: filter_starting_len,
+            bloom_length_mult: filter_starting_len_mult,
+            hash_family_size,
+            filter_layer: ShardType::Cartographer,
+            key_cache: vec![],
+            storage_path,
+        }
+    }
+
+    fn new_inheritor_shard(
+        key_count: u64,
+        filter_starting_len: usize,
+        filter_starting_len_mult: usize,
+        storage_path: PathBuf,
+    ) -> Self {
+        let n = Self::expected_n(filter_starting_len, *REHASH_THRESHOLD.get().unwrap());
+        let hash_family_size = Self::optimal_k(filter_starting_len, n);
+
+        Self {
+            filter: bitvec![0; filter_starting_len],
+            key_count,
+            bloom_length: filter_starting_len,
+            bloom_length_mult: filter_starting_len_mult,
+            hash_family_size,
+            filter_layer: ShardType::Inheritor,
+            key_cache: vec![],
+            storage_path,
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, Clone)]
+pub enum ShardType {
+    Cartographer,
+    Inheritor,
+}
+
+impl ShardType {
+    pub fn as_static_str(&self) -> &'static str {
+        match self {
+            ShardType::Cartographer => "cartographer",
+            ShardType::Inheritor => "inheritor",
+            // ShardType::Harbinger => "harbinger",
+        }
+    }
+}
+
+const JUMP_HASH_SHIFT: i32 = 33;
+const JUMP_HASH_CONSTANT: u64 = 2862933555777941757;
+const JUMP: f64 = (1u64 << 31) as f64;
+
+// JumpConsistentHash function, rust port from the jave implementation
+// Link to the repo: https://github.com/ssedano/jump-consistent-hash/blob/master/src/main/java/com/github/ssedano/hash/JumpConsistentHash.java
+// Original algorithm founded in 2014 by google Lamping & Veach
+pub fn jump_hash_partition(key: u64, buckets: usize) -> usize {
+    let mut b: i64 = -1;
+    let mut j: i64 = 0;
+    let mut mut_key = key;
+
+    while j < buckets as i64 {
+        b = j;
+        mut_key = mut_key.wrapping_mul(JUMP_HASH_CONSTANT).wrapping_add(1);
+
+        let shifted = (mut_key >> JUMP_HASH_SHIFT).wrapping_add(1);
+        let exp = shifted.max(1) as f64;
+
+        j = ((b as f64 + 1.0) * (JUMP / exp)).floor() as i64;
+    }
+
+    b as usize
+}
+
+pub const HASH_SEED_SELECTION: [u64; 6] = [
+    0x8badf00d, 0xdeadbabe, 0xabad1dea, 0xdeadbeef, 0xcafebabe, 0xfeedface,
+];
+
