@@ -1,10 +1,17 @@
-use std::{fs, hash::Hash, io::{BufReader, BufWriter, Read, Write},path::PathBuf,sync::RwLock};
+use std::{
+    fs, 
+    hash::Hash, 
+    io::{BufReader, BufWriter, Read, Write},
+    path::PathBuf//sync::RwLock
+};
 use bitvec::{bitvec, vec::BitVec};
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use tempfile::TempDir;
 use anyhow::anyhow;
 
-use crate::perfect_bloomfilter::config::*;
+
+use crate::config::*;
 
 static REHASH_THRESHOLD: OnceCell<f64> = OnceCell::new();
 static REHASH_SWITCH: OnceCell<bool> = OnceCell::new();
@@ -67,7 +74,7 @@ impl PerfectBloomFilter {
         let shards = self.array_sharding_hash(key, shard_type);
 
         for shard in shards {
-            let shard = &shard_vec[shard].read().unwrap();
+            let shard = &shard_vec[shard].read();
             let hashes = shard.bloom_hash(key);
             let exist = shard.bloom_check(&hashes);
 
@@ -88,7 +95,7 @@ impl PerfectBloomFilter {
         let shards = self.array_sharding_hash(key, shard_type);
 
         for shard in shards {
-            let shard = &mut shard_vec[shard].write().unwrap();
+            let shard = &mut shard_vec[shard].write();
             let hashes = shard.bloom_hash(key);
             shard.bloom_insert(&hashes, key);
             let rehash = shard.rehash_check();
@@ -282,7 +289,7 @@ impl Shard {
 
         let mut len_bytes = [0u8; 4];
         let mut key_buf = Vec::with_capacity(1024);
-        const MAX_KEY_SIZE: usize = 1 << 20;
+        const MAX_KEY_SIZE: usize = 1 << 20; // this rejects anything bigger than 1 mb as a key
 
         while reader.read_exact(&mut len_bytes).is_ok() {
             let len = u32::from_be_bytes(len_bytes) as usize;

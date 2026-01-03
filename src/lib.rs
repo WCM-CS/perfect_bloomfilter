@@ -1,1 +1,2 @@
-pub mod perfect_bloomfilter;
+pub mod filter;
+pub mod config;
