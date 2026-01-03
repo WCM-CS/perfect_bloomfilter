@@ -35,7 +35,7 @@ let default_config = BloomFilterConfig::new()
 
 
 // Instantiate Perfect Bloomfilter
-let pf = PerfectBloomFilter::new_with_config(config);
+let pf = PerfectBloomFilter::new_with_config(default_config);
 // Or do this if you're okay with the defaults: let pf = PerfectBloomFilter::new();
 
 
