@@ -39,7 +39,15 @@ let pf = PerfectBloomFilter::new_with_config(config);
 
 // Or do this if you're okay with defaults: let pf = PerfectBloomFilter::new();
 
+// Key usage examples 
+let key_str_bytes = "gamma".as_bytes();   // casting a str to bytes
+let key_int_bytes = &5_u32.to_be_bytes(); // casting a u32 to bytes
 
+let _ = pf.insert(key_str_bytes);
+let _ = pf.insert(key_int_bytes);
 
+assert!(pf.contains(key_str_bytes));
+assert!(pf.contains(key_int_bytes));
+assert!(!pf.contains("delta".as_bytes()));
 
 
