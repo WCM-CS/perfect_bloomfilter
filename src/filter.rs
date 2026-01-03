@@ -102,7 +102,7 @@ impl PerfectBloomFilter {
             shard.drain(rehash);
 
             if rehash {
-                if *REHASH_SWITCH.get().unwrap() {
+                if *REHASH_SWITCH.get().unwrap() { // note when rehash is off it still draisn first aka writes to disk
                     shard.rehash_bloom().map_err(|e| anyhow!("Error: {}", e))?;
                 }
             }
