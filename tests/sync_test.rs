@@ -3,8 +3,6 @@ mod tests {
     use std::{io::Read, time::Duration};
     use once_cell::sync::Lazy;
 
-
-
     // Bloom filter imports
     use perfect_bloomfilter::config::*;
     use perfect_bloomfilter::filter::PerfectBloomFilter;
