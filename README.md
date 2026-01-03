@@ -40,7 +40,7 @@ let max_config = BloomFilterConfig::new()
     .with_initial_capacity(Capacity::VeryHigh);
 
 let minimal_filter_no_rehash = BloomFilterConfig::new()
-    .with_rehash(false) // No dynamic scaling scaling
+    .with_rehash(false) // No dynamic scaling
     .with_throughput(Throughput::Low)
     .with_accuracy(Accuracy::Medium)
     .with_initial_capacity(Capacity::Low);
