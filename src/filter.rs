@@ -1,10 +1,7 @@
 use std::{
-    fs, 
-    hash::Hash, 
-    io::{BufReader, BufWriter, Read, Write},
-    path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}
+    fs, hash::Hash, io::{BufReader, BufWriter, Read, Write}, panic, path::PathBuf, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}
 };
-use bitvec::{bitvec, vec::BitVec};
+use crossbeam_queue::SegQueue;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use tempfile::TempDir;
@@ -65,7 +62,7 @@ impl PerfectBloomFilter {
             return Err(anyhow!("Insertion Failed"))
         }
 
-        return Ok(())
+        Ok(())
     }
 
     fn existence_check(&self, key: &[u8], shard_type: &ShardType) -> bool {
@@ -77,7 +74,7 @@ impl PerfectBloomFilter {
         let shards = self.array_sharding_hash(key, shard_type);
 
         for shard in shards {
-            let shard = &shard_vec[shard].read();
+            let shard = shard_vec[shard].read();
             let hashes = shard.bloom_hash(key);
             let exist = shard.bloom_check(&hashes);
 
@@ -97,7 +94,7 @@ impl PerfectBloomFilter {
 
         let shards = self.array_sharding_hash(key, shard_type);
         for shard_idx in shards {
-            let shard_guard = &mut shard_vec[shard_idx].write();
+            let shard_guard = shard_vec[shard_idx].read();
             let hashes = shard_guard.bloom_hash(key);
             shard_guard.bloom_insert(&hashes, key);
 
@@ -159,15 +156,27 @@ impl PerfectBloomFilter {
             Accuracy::High => 19.0,
         };
 
+        let workers: usize = match config.workers() {
+            Workers::Cores1 => 1usize,
+            Workers::Cores4 => 4usize,
+            Workers::Cores8 => 8usize,
+            Workers::HalfSysMax => {
+                match std::thread::available_parallelism() {
+                    Ok(cores) => cores.get(),
+                    Err(_) => panic!("Failed to get sys core for max parallelism")
+                }
+            },
+        };
+
         REHASH_THRESHOLD.set(threshold).ok();
         REHASH_SWITCH.set(config.rehash()).ok();
 
-        // Rehasher thread
+        // Rehasher threadZ
         let (tx, rx) = unbounded::<Arc<RwLock<Shard>>>();
-        for _ in 0..4 {
-            let thread_rx = rx.clone(); // In Crossbeam, Receiver is Cloneable!
+        for _ in 0..workers {
+            let thread_rx = rx.clone(); // crossbeam clonable receiver, thread save via our Arc 
             std::thread::spawn(move || {
-                // Each thread waits for its own shard to process
+                // Each thread waits for its shard to process
                 while let Ok(shard_arc) = thread_rx.recv() {
                     Self::background_rehasher_loop_logic(shard_arc);
                 }
@@ -194,14 +203,12 @@ impl PerfectBloomFilter {
             cartographer.push(Arc::new(RwLock::new(Shard::new_cartographer_shard(
                 0,
                 1usize << filter_len_mult,
-                filter_len_mult,
                 carto_path,
             ))));
 
             inheritor.push(Arc::new(RwLock::new(Shard::new_inheritor_shard(
                 0,
                 1usize << filter_len_mult,
-                filter_len_mult,
                 inheritor_path,
             ))));
         }
@@ -215,52 +222,64 @@ impl PerfectBloomFilter {
     }
 
     fn background_rehasher_loop_logic(shard_arc: Arc<RwLock<Shard>>) {
-        // PHASE 1: Finalize current disk state
+        // Snap current cache to disk
         let (path, new_len, new_k, layer) = {
-            let mut s = shard_arc.write();
+            let s = shard_arc.write();
             s.drain(true); // Force everything currently in RAM to disk first
-            (s.storage_path.clone(), s.bloom_length * 2, s.optimal_k_for_next_size(), s.filter_layer.clone())
+            (s.storage_path.clone(), s.bloom_length.load(Ordering::Relaxed) * 2, s.optimal_k_for_next_size(), s.filter_layer.clone())
         };
 
-        //  Heavy Lifting (No Lock)
+        //  Heavy Lifting, no locks held
         // builds new bitvec fro all the keys we wrote to the file
-        let mut new_bitset = build_filter_from_disk(&path, new_len, new_k, &layer);
+        let new_bitset = build_filter_from_disk(&path, new_len, new_k, &layer);
 
-        // Catch-Up (Write Lock)
+        // Catch-Up, write locked shard
         {
             let mut shard = shard_arc.write();
             
             // Take everything that arrived while we were reading Phase 2 aka temp cache
-            let key_backlog = std::mem::take(&mut shard.key_cache);
-            for key in &key_backlog {
-                let hashes = static_bloom_hash(key, new_len, new_k, &layer);
+            let mut catch_up_keys = Vec::new();
+            while let Some(key) = shard.key_cache.pop() {
+                let hashes = static_bloom_hash(&key, new_len, new_k, &layer);
                 for h in hashes {
-                    new_bitset.set(h, true);
+                    let bucket = h / 64;
+                    let bit_pos = h & 63; 
+                    let bit_mask = 1u64 << bit_pos;
+                    new_bitset[bucket].fetch_or(bit_mask, Ordering::Relaxed);
                 }
+                catch_up_keys.push(key);
             }
 
             // Apply new state
             shard.filter = new_bitset;
-            shard.bloom_length = new_len;
-            shard.hash_family_size = new_k;
+            shard.bloom_length.store(new_len, Ordering::SeqCst);
+            shard.hash_family_size.store(new_k, Ordering::SeqCst);
 
-            shard.key_cache = key_backlog; // add this back to key cahce so it wil get written to disk
-            shard.drain(true); // Persist the catch-up keys immediately
+            //shard.key_cache = key_backlog; // add this back to key cahce so it wil get written to disk
 
-            shard.is_rehashing.store(false, Ordering::SeqCst);
+            for key in catch_up_keys {
+                shard.key_cache.push(key);
+            }
+
+
+            // Persist the catch-up keys immediately, log source truth transaction
+            // May not be needed but ensures we are synced adnd after swap we alreday have a lock
+            shard.drain(true);
+
+            shard.is_rehashing.store(false, Ordering::Release);
         }
     }
-
 }
 
+
+
 pub struct Shard {
-    filter: BitVec,
+    filter: Vec<AtomicU64>,
     filter_layer: ShardType,
-    key_count: u64,
-    bloom_length: usize,
-    bloom_length_mult: usize,
-    hash_family_size: usize,
-    key_cache: Vec<Vec<u8>>,
+    key_count: AtomicU64,
+    bloom_length: AtomicUsize,
+    hash_family_size: AtomicUsize,
+    key_cache: SegQueue<Vec<u8>>,
     storage_path: PathBuf,
     is_rehashing: AtomicBool
 }
@@ -294,10 +313,12 @@ impl Shard {
         let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[0]);
         let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[1]);
 
-        let mut hash_list = Vec::with_capacity(self.hash_family_size);
-        for idx in 0..self.hash_family_size {
+        let family_k_size = self.hash_family_size.load(Ordering::Relaxed);
+
+        let mut hash_list = Vec::with_capacity(family_k_size);
+        for idx in 0..family_k_size {
             let idx_u128 = idx as u128;
-            let mask = (&self.bloom_length - 1) as u128;
+            let mask = (&self.bloom_length.load(Ordering::Relaxed) - 1) as u128;
 
             // Kirsch-Mitzenmacher optimization
             let index = hash1.wrapping_add(idx_u128.wrapping_mul(hash2)) & mask;
@@ -308,17 +329,38 @@ impl Shard {
         hash_list
     }
 
-    fn bloom_insert(&mut self, hashes: &[usize], key: &[u8]) {
-        hashes.iter().for_each(|hash| self.filter.set(*hash, true));
-        self.key_count += 1;
+    fn bloom_insert(&self, hashes: &[usize], key: &[u8]) {
+        for h in hashes {
+            let bucket = h / 64; // u64 in the vec whihc holds our idx
+            let bit_pos = h & 63; // bit in the u64 out hash shmacks into
+            let bit_mask = 1u64 << bit_pos; // hash bit representation
+
+            // we try to flip the bit, if its alreay flipped no cas loop, move on to next hash
+            self.filter[bucket].fetch_or(bit_mask, Ordering::Relaxed);
+        }
+
+        self.key_count.fetch_add(1, Ordering::Relaxed);
         self.key_cache.push(key.to_vec());
+
+
+        // hashes.iter().for_each(|hash| self.filter.set(*hash, true));
+        // self.key_count += 1;
+        // self.key_cache.push(key.to_vec());
     }
 
     fn bloom_check(&self, hashes: &[usize]) -> bool {
-        hashes.iter().all(|hash| self.filter[*hash])
+        hashes.iter().all(|h| {
+            let bucket = h / 64; // u64 in the vec whihc holds our idx
+            let bit_pos = h & 63; // bit in the u64 out hash shmacks into
+            let bit_mask = 1u64 << bit_pos; // hash bit representation
+
+            let val = self.filter[bucket].load(Ordering::Relaxed);
+
+            (val & bit_mask) != 0
+        })
     }
 
-    fn drain(&mut self, force_drain: bool) {
+    fn drain(&self, force_drain: bool) {
         if self.key_cache.is_empty() { return; }
     
         let rehashing = self.is_rehashing.load(Ordering::SeqCst);
@@ -326,29 +368,22 @@ impl Shard {
             return; // Stay in RAM until the rehasher is ready for Phase 3
         }
 
-        if self.key_cache.len() >= 50 || force_drain {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.storage_path)
-                .unwrap();
+        if (self.key_cache.len() >= 50 || force_drain)
+            && let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(&self.storage_path) {
+                let mut writer = BufWriter::new(file);
+                // Pop from SegQueue instead of mem::take
+                while let Some(bytes) = self.key_cache.pop() {
+                    let len = bytes.len() as u32;
+                    let _ = writer.write_all(&len.to_be_bytes());
+                    let _ = writer.write_all(&bytes);
+                }
 
-            let mut writer = BufWriter::new(file);
-
-            
-            let keys = std::mem::take(&mut self.key_cache);
-            for bytes in keys {
-                let len = bytes.len() as u32;
-                writer.write_all(&len.to_be_bytes()).ok();
-                writer.write_all(&bytes).ok();
+                let _ = writer.flush();
             }
-
-            writer.flush().ok();
-        }
     }
 
     fn rehash_check(&self) -> bool {
-        (self.bloom_length as f64 / self.key_count as f64) <= *REHASH_THRESHOLD.get().unwrap()
+        (self.bloom_length.load(Ordering::Relaxed) as f64 / self.key_count.load(Ordering::Relaxed) as f64) <= *REHASH_THRESHOLD.get().unwrap()
     }
 
     fn expected_n(new_m: usize, bits_per_key_threshold: f64) -> usize {
@@ -360,55 +395,57 @@ impl Shard {
     }
 
     pub fn optimal_k_for_next_size(&self) -> usize {
-        let new_m = self.bloom_length * 2;
+        let new_m = self.bloom_length.load(Ordering::Relaxed) * 2;
         let expected_n = Self::expected_n(new_m, *REHASH_THRESHOLD.get().unwrap());
         Self::optimal_k(new_m, expected_n)
     }
 
     
 
-    fn new_cartographer_shard(
+    fn new_shard(
         key_count: u64,
         filter_starting_len: usize,
-        filter_starting_len_mult: usize,
         storage_path: PathBuf,
+        shard_type: ShardType,
+
     ) -> Self {
         let n = Self::expected_n(filter_starting_len, *REHASH_THRESHOLD.get().unwrap());
         let hash_family_size = Self::optimal_k(filter_starting_len, n);
 
+        let num_buckets = filter_starting_len / 64;
+        let mut filter = Vec::with_capacity(num_buckets);
+
+        for _ in 0..num_buckets {
+            filter.push(AtomicU64::new(0));
+        }
+
+
         Self {
-            filter: bitvec![0; filter_starting_len],
-            key_count,
-            bloom_length: filter_starting_len,
-            bloom_length_mult: filter_starting_len_mult,
-            hash_family_size,
-            filter_layer: ShardType::Cartographer,
-            key_cache: vec![],
+            filter,
+            filter_layer: shard_type,
+            key_count: AtomicU64::new(key_count),
+            bloom_length: AtomicUsize::new(filter_starting_len),
+            hash_family_size: AtomicUsize::new(hash_family_size),
+            key_cache: SegQueue::new(),
             storage_path,
-            is_rehashing: AtomicBool::new(false)
+            is_rehashing: AtomicBool::new(false),
         }
     }
 
-    fn new_inheritor_shard(
+    pub fn new_cartographer_shard(
         key_count: u64,
         filter_starting_len: usize,
-        filter_starting_len_mult: usize,
         storage_path: PathBuf,
     ) -> Self {
-        let n = Self::expected_n(filter_starting_len, *REHASH_THRESHOLD.get().unwrap());
-        let hash_family_size = Self::optimal_k(filter_starting_len, n);
+        Self::new_shard(key_count, filter_starting_len, storage_path, ShardType::Cartographer)
+    }
 
-        Self {
-            filter: bitvec![0; filter_starting_len],
-            key_count,
-            bloom_length: filter_starting_len,
-            bloom_length_mult: filter_starting_len_mult,
-            hash_family_size,
-            filter_layer: ShardType::Inheritor,
-            key_cache: vec![],
-            storage_path,
-            is_rehashing: AtomicBool::new(false)
-        }
+    pub fn new_inheritor_shard(
+        key_count: u64,
+        filter_starting_len: usize,
+        storage_path: PathBuf,
+    ) -> Self {
+        Self::new_shard(key_count, filter_starting_len, storage_path, ShardType::Inheritor)
     }
 
 
@@ -462,8 +499,17 @@ pub const HASH_SEED_SELECTION: [u64; 6] = [
 ];
 
 
-fn build_filter_from_disk(path: &PathBuf, m: usize, k: usize, shard_type: &ShardType) -> BitVec {
-    let mut new_filter = bitvec![0; m];
+fn build_filter_from_disk(path: &PathBuf, m: usize, k: usize, shard_type: &ShardType) -> Vec<AtomicU64> {
+    //let mut new_filter = bitvec![0; m];
+    let len = m / 64;
+
+    //let new_filter: Vec<AtomicU64> = Vec::with_capacity(len);
+    let new_filter: Vec<AtomicU64> = (0..len).map(|_| AtomicU64::new(0)).collect();
+
+    //let new_filter: Vec<AtomicU64> = vec![AtomicU64::new(0); len];
+
+
+
     let file = fs::File::open(path).expect("Failed to open tmp file for rehash");
     let mut reader = BufReader::new(file);
     
@@ -477,9 +523,15 @@ fn build_filter_from_disk(path: &PathBuf, m: usize, k: usize, shard_type: &Shard
 
         let hashes = static_bloom_hash(&key_buf, m, k, shard_type);
         for h in hashes {
-            new_filter.set(h, true);
+            let bucket = h / 64; // u64 in the vec whihc holds our idx
+            let bit_pos = h & 63; // bit in the u64 out hash shmacks into
+            let bit_mask = 1u64 << bit_pos; // hash bit representation
+
+            // we try to flip the bit, if its alreay flipped no cas loop, move on to next hash
+            new_filter[bucket].fetch_or(bit_mask, Ordering::Relaxed);
         }
     }
+
     new_filter
 }
 

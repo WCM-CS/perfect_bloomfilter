@@ -8,7 +8,7 @@ mod tests {
     use perfect_bloomfilter::filter::PerfectBloomFilter;
 
 
-    static COUNT: i32 = 1_000_000;
+    static COUNT: i32 = 10_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         tracing_subscriber::fmt()
@@ -30,7 +30,8 @@ mod tests {
             .with_rehash(true)
             .with_throughput(Throughput::Medium)
             .with_accuracy(Accuracy::Medium)
-            .with_initial_capacity(Capacity::Medium);
+            .with_initial_capacity(Capacity::Medium)
+            .with_worker_cores(Workers::Cores1);
 
         tracing::info!("Creating PerfectBloomFilter instance");
         let pf = PerfectBloomFilter::new_with_config(config);
