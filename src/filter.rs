@@ -1,5 +1,7 @@
 use std::{
-    fs, hash::Hash, io::{BufReader, BufWriter, Read, Write}, panic, path::PathBuf, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}
+    fs, hash::Hash, io::{BufReader, BufWriter, Read, Write}, 
+    panic, path::PathBuf, 
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}
 };
 use crossbeam_queue::SegQueue;
 use once_cell::sync::OnceCell;
@@ -17,7 +19,7 @@ static REHASH_SWITCH: OnceCell<bool> = OnceCell::new();
 pub struct PerfectBloomFilter {
     pub(crate) cartographer: Vec<Arc<RwLock<Shard>>>, // tier 1 
     pub(crate) inheritor: Vec<Arc<RwLock<Shard>>>, // tier 2
-    
+
     rehash_tx: Sender<Arc<RwLock<Shard>>>,
     
     #[allow(dead_code)]

@@ -67,3 +67,9 @@ assert!(pf.contains(key_int_bytes));
 assert!(!pf.contains("delta".as_bytes()));
 
 
+MIMALLOC_RESERVE_OS_MEMORY="1g" \
+MIMALLOC_DISALLOW_OS_ALLOC="1" \
+MIMALLOC_ARENA_RESERVE_HUGE="1" \
+MIMALLOC_SHOW_STATS="1" \
+cargo test --release -- --nocapture
+

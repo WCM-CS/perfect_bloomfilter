@@ -9,6 +9,8 @@ anyhow = "1.0.100"
 bitvec = "1.0.1"
 crossbeam-channel = "0.5.15"
 crossbeam-queue = "0.3.12"
+mimalloc = { version = "0.1.48", features = ["v3"] }
+libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
 once_cell = "1.21.3"
 parking_lot = "0.12.5"
 tempfile = "3.23.0"

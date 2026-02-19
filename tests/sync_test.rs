@@ -1,3 +1,7 @@
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(test)]
 mod tests {
     use std::{io::Read, time::Duration};
