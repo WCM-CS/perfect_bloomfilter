@@ -6,13 +6,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod tests {
     use std::{io::Read, time::Duration};
     use once_cell::sync::Lazy;
-
+  
     // Bloom filter imports
     use perfect_bloomfilter::config::*;
     use perfect_bloomfilter::filter::PerfectBloomFilter;
 
 
-    static COUNT: i32 = 10_000_000;
+    static COUNT: i32 = 100_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         tracing_subscriber::fmt()

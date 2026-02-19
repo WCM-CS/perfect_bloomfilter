@@ -362,7 +362,11 @@ impl Shard {
                     let _ = writer.write_all(&bytes);
                 }
 
-                let _ = writer.flush();
+                if force_drain {
+                    let _ = writer.flush();
+                }
+
+                //let _ = writer.flush();
             }
     }
 
