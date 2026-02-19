@@ -2,14 +2,14 @@ use std::{
     fs, 
     hash::Hash, 
     io::{BufReader, BufWriter, Read, Write},
-    path::PathBuf, sync::{Arc, atomic::AtomicBool}//sync::RwLock
+    path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}
 };
 use bitvec::{bitvec, vec::BitVec};
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use tempfile::TempDir;
 use anyhow::anyhow;
-use crossbeam_channel::{Sender, Receiver, unbounded};
+use crossbeam_channel::{Sender, unbounded};
 
 
 use crate::config::*;
@@ -164,7 +164,7 @@ impl PerfectBloomFilter {
 
         // Rehasher thread
         let (tx, rx) = unbounded::<Arc<RwLock<Shard>>>();
-        for i in 0..4 {
+        for _ in 0..4 {
             let thread_rx = rx.clone(); // In Crossbeam, Receiver is Cloneable!
             std::thread::spawn(move || {
                 // Each thread waits for its own shard to process
@@ -215,49 +215,39 @@ impl PerfectBloomFilter {
     }
 
     fn background_rehasher_loop_logic(shard_arc: Arc<RwLock<Shard>>) {
-        // Phase 1: Heavy Lifting (READ LOCK ONLY FOR METADATA)
-
-        {
-            let mut s = shard_arc.write();
-            s.drain(true);
-        }
-
+        // PHASE 1: Finalize current disk state
         let (path, new_len, new_k, layer) = {
-            let s = shard_arc.read();
-            (
-                s.storage_path.clone(), 
-                s.bloom_length * 2, 
-                s.optimal_k_for_next_size(), 
-                s.filter_layer.clone()
-            )
+            let mut s = shard_arc.write();
+            s.drain(true); // Force everything currently in RAM to disk first
+            (s.storage_path.clone(), s.bloom_length * 2, s.optimal_k_for_next_size(), s.filter_layer.clone())
         };
 
+        //  Heavy Lifting (No Lock)
         let mut new_bitset = build_filter_from_disk(&path, new_len, new_k, &layer);
 
-        // Phase 2: The Sync Swap (BRIEF WRITE LOCK)
+        // Catch-Up (Write Lock)
         {
             let mut shard = shard_arc.write();
-            //shard.drain(true);
+            
+            // Take everything that arrived while we were reading Phase 2
             let key_backlog = std::mem::take(&mut shard.key_cache);
             
-            // CATCH UP: Hash everything that entered the RAM cache while we were reading disk
             for key in &key_backlog {
-                // Using a specialized hash function for the NEW dimensions
                 let hashes = static_bloom_hash(key, new_len, new_k, &layer);
                 for h in hashes {
                     new_bitset.set(h, true);
                 }
             }
 
-            // Commit the new filter to the shard
+            // Apply new state
             shard.filter = new_bitset;
             shard.bloom_length = new_len;
-            shard.bloom_length_mult += 1;
             shard.hash_family_size = new_k;
-            
-            // Clear the synced cache and release the rehash gate
-            //shard.key_cache.clear();
-            shard.is_rehashing.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            shard.key_cache = key_backlog; // add this back to key cahce so it wil get written to disk
+            shard.drain(true); // Persist the catch-up keys immediately
+
+            shard.is_rehashing.store(false, Ordering::SeqCst);
         }
     }
 
@@ -329,14 +319,14 @@ impl Shard {
     }
 
     fn drain(&mut self, force_drain: bool) {
+        if self.key_cache.is_empty() { return; }
+    
+        let rehashing = self.is_rehashing.load(Ordering::SeqCst);
+        if rehashing && !force_drain {
+            return; // Stay in RAM until the rehasher is ready for Phase 3
+        }
+
         if self.key_cache.len() >= 50 || force_drain {
-        
-            let is_rehashing = self.is_rehashing.load(std::sync::atomic::Ordering::SeqCst);
-
-            if is_rehashing && !force_drain {
-                return;
-            }
-
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
