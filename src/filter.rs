@@ -223,15 +223,15 @@ impl PerfectBloomFilter {
         };
 
         //  Heavy Lifting (No Lock)
+        // builds new bitvec fro all the keys we wrote to the file
         let mut new_bitset = build_filter_from_disk(&path, new_len, new_k, &layer);
 
         // Catch-Up (Write Lock)
         {
             let mut shard = shard_arc.write();
             
-            // Take everything that arrived while we were reading Phase 2
+            // Take everything that arrived while we were reading Phase 2 aka temp cache
             let key_backlog = std::mem::take(&mut shard.key_cache);
-            
             for key in &key_backlog {
                 let hashes = static_bloom_hash(key, new_len, new_k, &layer);
                 for h in hashes {
