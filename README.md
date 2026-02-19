@@ -18,13 +18,29 @@ Concurrency:
 - Due to the granular internal locking mechanisms the filter is safe to use in both sync and async environments without any additional locking required by the user. The current specs are configurable to a maximum concurrency factor of 4096 write operation and non locking reads and writes.
 
 
-Perfect Bloomfilter Optimization Summary
+# Perfect Bloomfilter Optimization Summary
 
-Stage,Strategy,Rate (Keys/s),Boost,Bottleneck Removed
-Base,Blocking Mutex + Sync IO,"33,000",1.0x,Baseline
-Round A,Non-blocking IO Channel,"50,000",1.5x,Disk/File I/O Latency
-Round B,Atomic Inserts (Lock-free),"95,000",2.9x,Thread Contention & Context Switching
-Round C,Sandboxed Arena Allocator,"420,000",12.7x,Kernel Syscalls & Heap Fragmentation
+Base: Rehash occasionally Blocking on insert + Write locks on Insert
+* 10 million keys, 300 seconds
+* Rate: 33_000 keys per second
+
+Optimization Round A: Offloading file IO to non blocking channel + write locks on insert
+* 10 million keys, 200 Seconds
+* Rate: 50_000 keys/sec
+* Improvement: + 51.5%, 1.5x Boost
+
+Optimization Round B: Offloaded IO + Atomic Inserts (non locking inserts, only designated rehashing offloaded channel locks shards)
+* 10 million keys: 95 seconds
+* 30 million keys: 312 seconds
+* Rate: 95_000 keys/sec
+* Improvement: + 188%, 2.9x boost
+
+Optimization Round C: Offloaded IO + Atomic Inserts + Sandboxed allocator
+* 10 million keys: 23 seconds
+* 30 million keys: 70 seconds 
+* 100 million keys: 240 seconds
+* Rate: 420_000 keys/sec
+* Improvement: + 1_173%, 12.7x boost
 
 
 Test command example
