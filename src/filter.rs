@@ -17,6 +17,7 @@ static REHASH_SWITCH: OnceCell<bool> = OnceCell::new();
 pub struct PerfectBloomFilter {
     pub(crate) cartographer: Vec<Arc<RwLock<Shard>>>, // tier 1 
     pub(crate) inheritor: Vec<Arc<RwLock<Shard>>>, // tier 2
+    
     rehash_tx: Sender<Arc<RwLock<Shard>>>,
     
     #[allow(dead_code)]
@@ -262,7 +263,7 @@ impl PerfectBloomFilter {
             }
 
 
-            // Persist the catch-up keys immediately, log source truth transaction
+            // Persist the catch up keys immediately, log source truth transaction
             // May not be needed but ensures we are synced adnd after swap we alreday have a lock
             shard.drain(true);
 
@@ -285,25 +286,6 @@ pub struct Shard {
 }
 
 impl Shard {
-    pub fn bloom_hash_with_params(&self, key: &[u8], m: usize, k: usize) -> Vec<usize> {
-        let hash_seeds = match self.filter_layer {
-            ShardType::Cartographer => [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]],
-            ShardType::Inheritor => [HASH_SEED_SELECTION[4], HASH_SEED_SELECTION[5]],
-        };
-
-        let hash1 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[0]);
-        let hash2 = xxhash_rust::xxh3::xxh3_128_with_seed(key, hash_seeds[1]);
-
-        let mut hash_list = Vec::with_capacity(k);
-        let mask = (m - 1) as u128;
-
-        for idx in 0..k {
-            let index = hash1.wrapping_add((idx as u128).wrapping_mul(hash2)) & mask;
-            hash_list.push(index as usize);
-        }
-        hash_list
-    }
-
     pub fn bloom_hash(&self, key: &[u8]) -> Vec<usize> {
         let hash_seeds = match self.filter_layer {
             ShardType::Cartographer => [HASH_SEED_SELECTION[2], HASH_SEED_SELECTION[3]],
