@@ -1,14 +1,18 @@
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(test)]
 mod tests {
     use std::{io::Read, time::Duration};
     use once_cell::sync::Lazy;
-
+  
     // Bloom filter imports
     use perfect_bloomfilter::config::*;
     use perfect_bloomfilter::filter::PerfectBloomFilter;
 
 
-    static COUNT: i32 = 10_000_000;
+    static COUNT: i32 = 100_000_000;
 
     static TRACING: Lazy<()> = Lazy::new(|| {
         tracing_subscriber::fmt()
@@ -30,23 +34,13 @@ mod tests {
             .with_rehash(true)
             .with_throughput(Throughput::Medium)
             .with_accuracy(Accuracy::Medium)
-            .with_initial_capacity(Capacity::Medium);
+            .with_initial_capacity(Capacity::Medium)
+            .with_worker_cores(Workers::Cores1);
 
         tracing::info!("Creating PerfectBloomFilter instance");
         let pf = PerfectBloomFilter::new_with_config(config);
 
       
-        let key_str_bytes = "gamma".as_bytes();
-        let key_int_bytes = &5_u32.to_be_bytes();
-
-
-        let _ = pf.insert(key_str_bytes);
-        let _ = pf.insert(key_int_bytes);
-
-        assert!(pf.contains(key_str_bytes));
-        assert!(pf.contains(key_int_bytes));
-        assert!(!pf.contains("delta".as_bytes()));
-    
 
         tracing::info!("Contains & insert & contains check");
         for i in 0..COUNT {

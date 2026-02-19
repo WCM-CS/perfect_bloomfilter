@@ -4,6 +4,7 @@ pub struct BloomFilterConfig {
     pub throughput: Option<Throughput>, // 12
     pub accuracy: Option<Accuracy>,     // 15.0
     pub initial_capacity: Option<Capacity>, // 12
+    pub worker_cores: Option<Workers>,           // rehashing worker cores
                                         // NEW FEATURES ~ TO_DO()!!
                                         // pub cascade_tiers: Option<Tiers> Options: 1, 2, 3
                                         // pub persistence: Option<bool>
@@ -35,6 +36,16 @@ pub enum Capacity {
     VeryHigh,
 }
 
+// rehashing worker cores
+#[derive(Debug, Clone, Copy)]
+pub enum Workers {
+    Cores1,
+    Cores4,
+    Cores8,
+    HalfSysMax,
+}
+
+
 impl Default for BloomFilterConfig {
     fn default() -> Self {
         Self {
@@ -42,6 +53,7 @@ impl Default for BloomFilterConfig {
             throughput: Some(Throughput::Medium),
             accuracy: Some(Accuracy::Medium),
             initial_capacity: Some(Capacity::Medium),
+            worker_cores: Some(Workers::Cores1) // default to one offloaded rehashing core, force user to spec further 
         }
     }
 }
@@ -51,6 +63,7 @@ impl BloomFilterConfig {
         Self::default()
     }
 
+    // setters
     pub fn with_rehash(mut self, rehash: bool) -> Self {
         self.rehash = Some(rehash);
         self
@@ -71,6 +84,13 @@ impl BloomFilterConfig {
         self
     }
 
+    pub fn with_worker_cores(mut self, workers: Workers) -> Self {
+        self.worker_cores = Some(workers);
+        self
+    }
+
+
+    // getters
     pub fn rehash(&self) -> bool {
         self.rehash.unwrap_or(true)
     }
@@ -85,5 +105,9 @@ impl BloomFilterConfig {
 
     pub fn initial_capacity(&self) -> Capacity {
         self.initial_capacity.unwrap_or(Capacity::Medium)
+    }
+
+    pub fn workers(&self) -> Workers {
+        self.worker_cores.unwrap_or(Workers::Cores1)
     }
 }
