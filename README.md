@@ -2,7 +2,7 @@
 Probabilistic accuracy guaranteed
 
 What is this?
-- In-memory hybrid dynamically scalable cascading multidimensional bloom filter with a simple API. Rehashes and hotswaps filter shards when probability of a false positive hits the threshold. Crossbeam channel is used for offloading file IO. Shards use parking lot RwLocks but inserts and contains oprtations do not lock, they atomically mutate shards internals. Only background workers lock shards during part of their operation. Currently configured to use a sandboxed mimalloc arena allocator.
+- In-memory hybrid dynamically scalable cascading multidimensional bloom filter with a simple API. Rehashes and hotswaps filter shards when probability of a false positive hits the given threshold. Crossbeam channel is used for offloading file IO. Shards use parking lot RwLocks but inserts and contains oprtations do not lock, they atomically mutate shards internals. Only background workers lock shards during non-blocking parts of their operation. Currently configured to use a sandboxed mimalloc arena as the global heap allocator.
 
 Notes:
 - Uses file IO/disk space for bitvec atomic hot swap.
@@ -15,7 +15,7 @@ Max key size: 1MB.
 - If a key surpasses 1MB the reader will assume file is corrupt and fail the shard rehash operation to avoid corrupting in memory representation (which increases risk of false positives of not atomically handled in your application).
 
 Concurrency:
-- Due to the granular internal locking mechanisms the filter is safe to use in both sync and async environments without any additional locking required by the user. The current specs are configurable to a maximum concurrency factor of 4096 write operation and non locking reads and writes.
+- Due to the granular locking & atomic internals the filter is safe to use in highly concurrent environments without any additional locking required by the user. The current specs are configurable to a maximum concurrency factor of 4096 write operation with non-locking read and write operations.
 
 
 # Perfect Bloomfilter Optimization Summary
