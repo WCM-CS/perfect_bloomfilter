@@ -107,4 +107,4 @@ assert!(!pf.contains("delta".as_bytes()));
 ```
 
 
-[![Initial calculations from the rough draft](preview.png)](initial_writeup.pdf)
+View additional information:** [Initial calculations from the rough draft](initial_writeup.pdf)
