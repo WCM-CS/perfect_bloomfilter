@@ -102,3 +102,9 @@ let _ = pf.insert(key_int_bytes);
 assert!(pf.contains(key_str_bytes));
 assert!(pf.contains(key_int_bytes));
 assert!(!pf.contains("delta".as_bytes()));
+
+
+```
+
+
+[Initial calculations from the rough draft](initial_writeup.pdf)
